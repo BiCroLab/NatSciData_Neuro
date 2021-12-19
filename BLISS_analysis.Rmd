@@ -1,0 +1,1242 @@
+---
+title: "BLISS Neurons Analysis"
+author: "Federico Agostini"
+date: "20/08/2019"
+output: html_notebook
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+require("knitr")
+knitr::opts_chunk$set(dev='CairoPNG', dpi=300, fig_height=480, fig_width=800)
+```
+
+## Session information: {-}
+
+```{r setupEnv, include=FALSE}
+working.folder = "."
+png.folder = file.path(working.folder, "images")
+if( !dir.exists(png.folder) ) dir.create(png.folder)
+pdf.folder = file.path(working.folder, "plots")
+if( !dir.exists(pdf.folder) ) dir.create(pdf.folder)
+rdata.folder = file.path(working.folder, "RData")
+annotation.folder = file.path(working.folder, "annotation")
+bliss.folder = file.path(working.folder, "data", "BLISS")
+rnaseq.folder = file.path(working.folder, "data", "RNAseq")
+hic.folder = file.path(working.folder, "data", "HiC")
+
+knitr::opts_knit$set(root.dir = working.folder)
+knitr::opts_chunk$set(echo = FALSE)
+
+setwd(working.folder)
+
+species = "Homo sapiens"
+genome = "hg19"
+version = 19
+
+chromosomes = paste0("chr", c(1:22, "X"))
+
+annotation.folder = file.path(annotation.folder, gsub(" ", "_", species), genome)
+```
+
+```{r sessionInfo, echo=FALSE}
+cat(sessionInfo()$R.version$version.string, fill=TRUE)
+cat(paste("Platform", sessionInfo()$platform), fill=TRUE)
+cat(paste("Running under", sessionInfo()$running), fill=TRUE)
+cat(paste("Last knitted on", date()), fill=TRUE)
+cat(paste("Species:", species), fill=TRUE)
+cat(paste("Genome assembly:", genome), fill=TRUE)
+cat(paste("Gencode version:", version), fill=TRUE)
+cat(paste("Chromosomes:", paste(chromosomes, collapse = " ")), fill=TRUE)
+cat(paste("Working folder:", working.folder), fill=TRUE)
+cat(paste("Annotation folder:", annotation.folder), fill=TRUE)
+cat(paste("RNAseq data folder:", rnaseq.folder), fill=TRUE)
+cat(paste("BLISS data folder:", bliss.folder), fill=TRUE)
+cat(paste("Hi-C data folder:", hic.folder), fill=TRUE)
+```
+
+```{r loadPackages, message=FALSE, results="hide", warning=FALSE}
+require("AnnotationDbi")
+require("GenomicFeatures")
+require("rtracklayer")
+
+require("data.table")
+
+require("ggplot2")
+require("gridExtra")
+require("cowplot")
+require("ggpubr")
+require("ggthemes")
+require("ggsci")
+require("scales")
+require("viridis")
+require("RColorBrewer")
+
+require("tximport")
+
+require("ChIPpeakAnno")
+require("ChIPseeker")
+require("org.Hs.eg.db")
+require("EnsDb.Hsapiens.v75")
+require("BSgenome.Hsapiens.UCSC.hg19")
+require("TxDb.Hsapiens.UCSC.hg19.knownGene")
+```
+
+### Functions
+
+```{r saveAndPlotFunction}
+save_and_plot <- function(x, bname, width, height, dpi=300, use.cowplot=FALSE, ncol=1, nrow=1, base_height=4, base_width=NULL, base_aspect_ratio=1, plot=FALSE, formats = c("png", "pdf", "eps")){
+  # Function to save the plot (and separately its data) to file and show the plot in the notebook
+  if( !use.cowplot ){
+    if ( "png" %in% formats) {
+      png(filename=file.path(png.folder, paste0(bname, ".png")),
+          units="in", height=height, width=width, res=dpi)
+      print(x)
+      while(length(dev.list())>0) invisible(dev.off())
+    }
+    if ( "pdf" %in% formats) {
+      cairo_pdf(filename=file.path(pdf.folder, paste0(bname, "_cairo_pdf.pdf")),
+                onefile = TRUE, height=height, width=width, family="Helvetica", pointsize=8, antialias="none")
+      print(x)
+      while(length(dev.list())>0) invisible(dev.off())
+    }
+  }else{
+    if ( "png" %in% formats) {
+      save_plot(x, filename=file.path(png.folder, paste0(bname, ".png")),
+                ncol = ncol, nrow = nrow, base_height = base_height, base_width = base_width, base_aspect_ratio = base_aspect_ratio, dpi=dpi)
+      while(length(dev.list())>0) invisible(dev.off())
+    }
+    if ( "pdf" %in% formats) {
+      save_plot(x, filename=file.path(pdf.folder, paste0(bname, "_cairo_pdf.pdf")),
+                ncol = ncol, nrow = nrow, base_height = base_height, base_width = base_width, base_aspect_ratio = base_aspect_ratio, device=cairo_pdf)
+      while(length(dev.list())>0) invisible(dev.off())
+    }
+  }
+  if( plot ) print(x)
+}
+```
+
+```{r correlationFunctions}
+continuousCorrelation = function(data, mapping) {
+  return(ggplot(data, mapping)
+         + geom_point(size = .5, alpha = .1)
+         + geom_density2d(aes(colour=..level..))
+         + scale_colour_viridis()
+  )
+}
+
+continuousCorrelation_mixed <- function(data, mapping) {
+  Xcol = rlang::get_expr(mapping$x)
+  x = data[[Xcol]]
+  Ycol = rlang::get_expr(mapping$y)
+  y = data[[Ycol]]
+  pcor = cor(x, y, use = "pairwise.complete.obs", method = "pearson")
+  scor = cor(x, y, use = "pairwise.complete.obs", method = "spearman")
+  return(ggplot(data, mapping) + geom_blank(
+  ) + annotate("text",
+               x = 1.5, y = 1.5,
+               label = sprintf("p: %.3f\ns: %.3f", pcor, scor)) + xlim(1, 2) + ylim(1, 2))
+}
+```
+
+```{r distanceProfileFunction}
+distanceToReference <- function(query, subject, width=100, fix=c("start", "end", "center"),
+                                ignore.strand=FALSE, collapse=TRUE, normType=c("none", "density", "max"), mcolsKey=NULL){
+  
+  fix = match.arg(fix)
+  normType = match.arg(normType)
+ 
+  query = resize(query, width=0, fix=fix)
+ 
+  if( !is.null(mcolsKey) ){
+    stopifnot( mcolsKey%in%colnames(mcols(query)) )
+    splitFactors = as.data.table(mcols(query))[, eval(mcolsKey), with=FALSE]
+    splitFactors = apply(splitFactors, 1, function(x) paste(gsub(" ", "", x), collapse = "_____"))
+    query = split(query, splitFactors)
+  }else{
+    query = GRangesList(query)
+  }
+  
+  res = lapply(query,
+               function(x){
+                 temp = flank(x, width=width-1, start=TRUE, both=TRUE)
+                 overlaps = as.data.table(findOverlaps(temp, subject, ignore.strand=ignore.strand, maxgap=0))
+                 toAdd = NULL
+                 if( nrow(overlaps) > 0 ){
+                   overlaps[, distance := distance(x[queryHits,], subject[subjectHits,])+1] # Count is 1-based from the TSS, which is the 0
+                   overlaps[, qStrand := as.character(strand(x[queryHits,]))]
+                   overlaps[qStrand%in%c("+", "*"), distance := ifelse(start(x[queryHits,]) > end(subject[subjectHits,]), -distance, distance)]
+                   overlaps[qStrand=="-", distance := ifelse(end(x[queryHits,]) < start(subject[subjectHits,]), -distance, distance)]
+                 }else{
+                   message("No overlaps found!")
+                   return(NULL)
+                 }
+                 
+                 result = overlaps[, .N, by=c("queryHits", "distance")]
+                 
+                 if( normType == "density" ){
+                   result[, Norm := N/sum(N), by="queryHits"]
+                 }else if( normType == "max" ){
+                   result[, Norm := N/max(N), by="queryHits"]
+                 }else{
+                   result[, Norm := N, by="queryHits"]
+                 }
+                 
+                 if( collapse == TRUE ){
+                   result = rbindlist(list(data.table(queryHits = NA, distance = seq(-width, width, 1), N = 0, Norm = rep(0, width*2+1)), result))
+                   result = result[, .(Count = sum(N), Mean = sum(Norm)/length(x), N=length(x)), by="distance"]
+                   return(result)
+                 }else{
+                   return(overlaps)
+                 }
+               })
+  if( !is.null(names(res)) ){
+    res = rbindlist(res, idcol="splitLabel")
+    res[, eval(mcolsKey) := tstrsplit(splitLabel, "_____")]
+    res[, splitLabel := NULL]
+  }else{
+    res = rbindlist(res)  
+  }
+  return(res)
+}
+```
+
+## Analysis
+
+### Gencode annotation and stats
+
+```{r createGencodeGroups}
+# Import Gencode pre-processed gene annotation files (see corresponding script)
+load(file.path(annotation.folder, "RData", paste0(genome, "_Gencode", version, "_genes_annotations.RData")))
+
+genes = keepSeqlevels(genes, chromosomes, pruning.mode = "coarse")
+genes.pc.granges = keepSeqlevels(genes.pc.granges, chromosomes, pruning.mode = "coarse")
+genes.pc.granges = genes.pc.granges[width(genes.pc.granges)>=1e3]
+
+# Import Gencode pre-processed transcript annotation files (see corresponding script)
+load(file.path(annotation.folder, "RData", paste0(genome, "_Gencode", version, "_txs_annotations.RData")))
+txs = txs[names(genes)]
+txs.metadata = txs.metadata[gene_id%in%names(genes),]
+
+# Define protein-coding genes, long_ncRNAs, ncRNAs and other
+protein.coding = c("protein_coding",
+                   paste(rep(c("IG","TR"), each=4), c("C","D","J","V"), "gene", sep="_"), "IG_LV_gene")
+long.ncRNA = c("3prime_overlapping_ncRNA", "lincRNA", "antisense", "processed_transcript", "sense_intronic",
+               "sense_overlapping", "bidirectional_promoter_lncRNA", "macro_lncRNA", "non_coding")
+ncRNA = c(setdiff(grep("RNA", names(geneBT), value=TRUE), long.ncRNA), "ribozyme")
+other = setdiff(names(geneBT), c(ncRNA, long.ncRNA, protein.coding))
+
+# Extract group gene_ids
+bioGroup_factors = factor(c("protein_coding", "long_ncRNA", "ncRNA", "other"),
+                          levels=c("protein_coding", "long_ncRNA", "ncRNA", "other"))
+protein.coding = as.vector(unlist(geneBT[protein.coding]))
+long.ncRNA = as.vector(unlist(geneBT[long.ncRNA]))
+ncRNA = as.vector(unlist(geneBT[ncRNA]))
+other = as.vector(unlist(geneBT[other]))
+
+# Add information to the gene metadata table
+gene.metadata = gene.metadata[seqnames%in%chromosomes & gene_id%in%names(genes),]
+gene.metadata[, bioGroup := factor(as.character(NA), levels=levels(bioGroup_factors))]
+gene.metadata[gene_id%in%protein.coding, bioGroup := "protein_coding"]
+gene.metadata[gene_id%in%long.ncRNA, bioGroup := "long_ncRNA"]
+gene.metadata[gene_id%in%ncRNA, bioGroup := "ncRNA"]
+gene.metadata[gene_id%in%other, bioGroup := "other"]
+
+gene.metadata[, entrez_id := mapIds(org.Hs.eg.db, keys = substr(gene_id, 1, 15),
+                                    column = "ENTREZID", keytype = "ENSEMBL", multiVals = "first")]
+
+# Define protein-coding genes, long_ncRNAs, ncRNAs and other
+protein.coding = c("protein_coding",
+                   paste(rep(c("IG","TR"), each=4), c("C","D","J","V"), "gene", sep="_"), "IG_LV_gene")
+long.ncRNA = c("3prime_overlapping_ncrna", "lincRNA", "antisense", "processed_transcript", "sense_intronic",
+               "sense_overlapping", "bidirectional_promoter_lncRNA", "macro_lncRNA", "non_coding")
+ncRNA = c(setdiff(grep("RNA", names(txsBT), value=TRUE), long.ncRNA), "ribozyme")
+pseudogene = grep("pseudo", names(txsBT), value = TRUE)
+other = setdiff(names(txsBT), c(pseudogene, ncRNA, long.ncRNA, protein.coding))
+
+# Extract group txs_ids
+protein.coding = as.vector(unlist(txsBT[protein.coding]))
+long.ncRNA = as.vector(unlist(txsBT[long.ncRNA]))
+ncRNA = as.vector(unlist(txsBT[ncRNA]))
+pseudogene = as.vector(unlist(txsBT[pseudogene]))
+other = as.vector(unlist(txsBT[other]))
+
+# Add information to the transcript metadata table
+txs.metadata = txs.metadata[seqnames%in%chromosomes & gene_id%in%names(genes),]
+txs.metadata[, bioGroup := factor(as.character(NA), levels=levels(bioGroup_factors))]
+txs.metadata[transcript_id%in%protein.coding, bioGroup := "protein_coding"]
+txs.metadata[transcript_id%in%long.ncRNA, bioGroup := "long_ncRNA"]
+txs.metadata[transcript_id%in%ncRNA, bioGroup := "ncRNA"]
+txs.metadata[transcript_id%in%pseudogene, bioGroup := "pseudogene"]
+txs.metadata[transcript_id%in%other, bioGroup := "other"]
+
+# Import the blacklist file
+blacklist = fread(file.path(annotation.folder, "hg19.blacklist.bed"), select=1:3, col.names=c("seqnames", "start", "end"))
+blacklist = blacklist[seqnames%in%chromosomes,]
+
+# Transform chromosome names, and coordinates to 1-based
+setkeyv(blacklist, colnames(blacklist))
+
+# Retrieve chromosome sizes
+chrom_sizes = with(fread(file.path(annotation.folder, "hg19.chrom.sizes"), header=FALSE),
+                   Seqinfo(seqnames=as.character(V1), seqlengths=V2, isCircular=NA, genome=genome))
+chrom_sizes = keepSeqlevels(chrom_sizes, chromosomes)
+```
+
+### Rosetta tables
+
+```{r Rosetta}
+rosettaTable = lapply(setNames(c("NES", "NPC", "NEU"), c("NES", "NPC", "NEU")),
+                      function(x)
+                        gene.metadata[bioGroup%in%c("protein_coding", "long_ncRNA"),
+                                      .(seqnames, start, end, width, strand, gene_id, gene_name, entrez_id, biotype=bioGroup)])
+```
+
+### RNA-seq
+
+```{r tximportSalmon}
+files = c(NES_1 = "P13658_101_S1_R1_001",
+          NES_2 = "P13658_102_S2_R1_001",
+          NES_3 = "P13658_103_S3_R1_001",
+          NPC_1 = "P13658_104_S4_R1_001",
+          NPC_2 = "P13658_105_S5_R1_001",
+          NPC_3 = "P13658_106_S6_R1_001",
+          NEU_1 = "P13658_107_S7_R1_001",
+          NEU_2 = "P13658_108_S8_R1_001",
+          NEU_3 = "P13658_109_S9_R1_001")
+
+files = setNames(file.path(rnaseq.folder, "salmon", files, "quant.sf"), names(files))
+
+# Bash command used to generate the tx2gene reference table from the gtf file
+# gffread Annotation/gencode.v19.annotation.gtf --table transcript_id,gene_id -o gencode.v19.tx2gene.tsv
+
+tx2gene = fread(file.path(annotation.folder, "gencode.v19.tx2gene.tsv"), header=FALSE, col.names = c("TXNAME", "GENEID"))
+txdf = copy(tx2gene)
+txdf[, ntx := .N, by="GENEID"]
+setcolorder(txdf, c(2, 1, 3))
+
+salmon_gns = tximport(files, type = "salmon", tx2gene = tx2gene, countsFromAbundance = "lengthScaledTPM")
+salmon_dds = tximport(files, type = "salmon", tx2gene = tx2gene, countsFromAbundance = "no") # countsFromAbundance = "no" is the default, and suggested by DESeq2 
+salmon_txs  = tximport(files, type = "salmon", tx2gene = tx2gene, countsFromAbundance = "dtuScaledTPM", txOut = TRUE)
+```
+
+```{r GeneExpression}
+expr_tpm = melt.data.table(data.table(as.data.frame(salmon_gns$abundance), keep.rownames = "gene_id"),
+                           id.vars = "gene_id")
+expr_tpm[, variable := gsub("_.*$", "", variable)]
+expr_tpm = expr_tpm[, .(value = mean(value)), by=c("variable", "gene_id")]
+setnames(expr_tpm, "variable", "Cell")
+setkeyv(expr_tpm, c("Cell", "gene_id"))
+```
+
+```{r Rosetta_Expression}
+rosettaTable = lapply(rosettaTable, function(x) x[gene_id%in%rownames(salmon_gns$abundance),])
+rosettaTable = lapply(setNames(c("NES", "NPC", "NEU"), c("NES", "NPC", "NEU")),
+            function(x){
+              expr = rowMeans(salmon_gns$abundance[, grep(x, colnames(salmon_gns$abundance))])
+              rosettaTable[[x]][, expression := expr[gene_id]]
+              return(rosettaTable[[x]])
+            })
+```
+
+### BLISS
+
+```{r metrics_NP_pipeline}
+# Load the sBLISS samples from BED
+bliss.files = list.files(bliss.folder, pattern="_summary.txt", full.names = TRUE)
+names(bliss.files) = gsub("_summary.txt", "", basename(bliss.files))
+
+select = c("NES_sBLISS_rep1", "NES_sBLISS_rep2",
+           "NPC_sBLISS_rep1", "NPC_sBLISS_rep2",
+           "NEU_sBLISS_rep1", "NEU_sBLISS_rep2")
+
+bliss.files = bliss.files[select]
+
+bliss_metrics = rbindlist(lapply(bliss.files,
+                       function(x){
+                         tmp = fread(x, fill=TRUE)[c(2, 6, 16, 17, 19, 21), data.table(t(V1))]
+                         setnames(tmp, c("Total", "Mapped", "Minus", "Plus", "Sites", "Events"))
+                         return(tmp)
+                         }), idcol="Dataset")
+
+bliss_metrics[, Dataset := gsub("sBLISS_", "", Dataset)]
+```
+
+```{r loadBED_NP_pipeline}
+bliss.files = list.files(bliss.folder, pattern=".bed", full.names = TRUE)
+names(bliss.files) = gsub(".bed", "", basename(bliss.files))
+
+select = c("NES_sBLISS_rep1", "NES_sBLISS_rep2",
+           "NPC_sBLISS_rep1", "NPC_sBLISS_rep2",
+           "NEU_sBLISS_rep1", "NEU_sBLISS_rep2")
+
+bliss.files = bliss.files[select]
+
+if( !file.exists(file.path(bliss.folder, "BLISS_NPpipeline.rds")) ){
+  BLISS_data = lapply(bliss.files,
+                      function(x){
+                        tmp = fread(x, showProgress=FALSE,
+                                    col.names=c("seqnames", "start", "end", "count"), select=1:4,
+                                    colClasses=c("character", "numeric", "numeric", "numeric"))
+                        tmp[, seqnames := paste0("chr", gsub("chr", "", seqnames))]
+                        tmp = tmp[seqnames%in%chromosomes,]
+                        tmp = with(tmp, promoters(GRanges(seqnames, IRanges(start, end), strand="*", count=count), 0, 1))
+                        # Filter out DSBs falling within blacklisted regions
+                        tmp = subsetByOverlaps(tmp, GRanges(blacklist), invert = TRUE)
+                        tmp = rep(tmp, tmp$count)
+                        tmp$count = NULL
+                        return(tmp)
+                      })
+  BLISS_data = BLISS_data[order(names(BLISS_data))]
+  saveRDS(BLISS_data, file=file.path(bliss.folder, "BLISS_NPpipeline.rds"))
+}else{
+  BLISS_data = readRDS(file.path(bliss.folder, "BLISS_NPpipeline.rds"))
+}
+
+BLISS_data = BLISS_data[select]
+
+BLISS_pooled = list(NES = c(BLISS_data[[1]], BLISS_data[[2]]),
+                    NPC = c(BLISS_data[[3]], BLISS_data[[4]]),
+                    NEU = c(BLISS_data[[5]], BLISS_data[[6]]))
+
+
+BLISS_data = list(NES_1 = BLISS_data[[1]], NES_2 = BLISS_data[[2]],
+                  NPC_1 = BLISS_data[[3]], NPC_2 = BLISS_data[[4]],
+                  NEU_1 = BLISS_data[[5]], NEU_2 = BLISS_data[[6]])
+
+librarySize = as.data.table(sapply(BLISS_data, length), keep.rownames = TRUE)
+setnames(librarySize, c("Sample", "Size"))
+setkey(librarySize, Sample)
+```
+
+```{r BLISS_ChIPSeeker_annotation}
+TxDb = TxDb.Hsapiens.UCSC.hg19.knownGene
+peakAnno <- lapply(BLISS_pooled,
+         function(x)
+           annotatePeak(x, tssRegion=c(-2000, 200), TxDb=keepSeqlevels(TxDb, chromosomes), annoDb="org.Hs.eg.db"))
+
+for( name in names(peakAnno) ){
+   png(filename = file.path(png.folder, paste0("BLISS_Tag_annotation_", name, ".png")), width = 8, height = 4, units = "in", res = 300)
+   plotAnnoPie(peakAnno[[name]])
+   dev.off()
+   pdf(file = file.path(pdf.folder, paste0("BLISS_Tag_annotation_", name, ".pdf")), width = 8, height = 4)
+   plotAnnoPie(peakAnno[[name]])
+   dev.off()
+}
+
+hg19 = unlist(resize(slidingWindows(keepSeqlevels(GRanges(seqinfo(BSgenome.Hsapiens.UCSC.hg19)),
+                                                  chromosomes, pruning.mode="coarse"),
+                                    width=100, step=100),
+                     width=1, fix="center"), use.names = FALSE)
+names(hg19) = NULL
+
+background = annotatePeak(hg19, tssRegion=c(-2000, 200), TxDb=keepSeqlevels(TxDb, chromosomes),
+                          annoDb="org.Hs.eg.db")
+pdf(file = file.path(pdf.folder, paste0("BLISS_Tag_annotation_Background.pdf")), width = 8, height = 4)
+plotAnnoPie(background)
+dev.off()
+```
+
+```{r Rosetta_BLISS}
+rosettaTable = lapply(setNames(c("NES", "NPC", "NEU"), c("NES", "NPC", "NEU")),
+                      function(x){
+                        rosettaTable[[x]][, `:=`(BLISS_prom = countOverlaps(promoters(GRanges(seqnames, IRanges(start, end), strand)),
+                                                                            BLISS_pooled[[x]])/length(BLISS_pooled[[x]])*1e6,
+                                                 BLISS_body = countOverlaps(GRanges(seqnames, IRanges(start, end), strand),
+                                                                            BLISS_pooled[[x]])/width*1e3/length(BLISS_pooled[[x]])*1e6)]
+                        return(rosettaTable[[x]])
+                      })
+```
+
+```{r BLISS_expressed_genes}
+expressed = rbindlist(rosettaTable)[, .(E=sum(expression)), by="gene_id"][E>0, gene_id]
+
+pl = rbindlist(lapply(rosettaTable,
+            function(x)
+              x[biotype=="protein_coding" & gene_id%in%expressed, .(gene_id, expression, BLISS_prom, BLISS_body,
+                    quartile = paste0("Q", findInterval(expression, quantile(expression, seq(0, 1, 0.25)),
+                                                        all.inside = TRUE)))]), idcol="Cell")
+pl[, Cell := factor(Cell, levels=names(rosettaTable))]
+
+gg1 = ggplot(pl, aes(x=quartile, y=BLISS_prom+1)) + ggtitle("Gene promoters (protein-coding)") +
+  geom_boxplot() + facet_grid(~Cell) + scale_y_log10("DSBs burden at gene promoter (CPM+1)") +
+  annotate("text", x = -Inf, y = Inf, vjust=1.5, hjust=-0.2, label=paste("N =", pl[, length(unique(gene_id))]), size=3) + xlab("Expression quartile") + stat_compare_means(ref.group="Q1", label="p.signif") +
+  theme_few()
+gg2 = ggplot(pl[BLISS_body<10,], aes(x=quartile, y=BLISS_body+1)) + ggtitle("Gene body (protein-coding)") +
+  geom_boxplot() + facet_grid(~Cell) + scale_y_log10("DSBs burden in gene (CPKM+1)") +
+  annotate("text", x = -Inf, y = Inf, vjust=1.5, hjust=-0.2, label=paste("N =", pl[, length(unique(gene_id))]), size=3) + xlab("Expression quartile") + stat_compare_means(ref.group="Q1", label="p.signif") +
+  theme_few()
+gg3 = ggplot(pl[BLISS_body<10,], aes(x=quartile, y=BLISS_body+1)) + ggtitle("Gene body (protein-coding) - ZoomIn") +
+  geom_boxplot() + facet_grid(~Cell) + scale_y_log10("DSBs burden in gene (CPKM+1)") +
+  annotate("text", x = -Inf, y = Inf, vjust=1.5, hjust=-0.2, label=paste("N =", pl[, length(unique(gene_id))]), size=3) + xlab("Expression quartile") + stat_compare_means(ref.group="Q1", label="p.signif") +
+  theme_few() + coord_cartesian(ylim=c(1, 1.5))
+ggA = ggarrange(gg1, gg2, gg3, ncol=1)
+
+pl = rbindlist(lapply(rosettaTable,
+            function(x)
+              x[biotype=="long_ncRNA" & gene_id%in%expressed, .(gene_id, expression, BLISS_prom, BLISS_body,
+                    quartile = paste0("Q", findInterval(expression, quantile(expression, seq(0, 1, 0.25)),
+                                                        all.inside = TRUE)))]), idcol="Cell")
+pl[, Cell := factor(Cell, levels=names(rosettaTable))]
+
+gg1 = ggplot(pl, aes(x=quartile, y=BLISS_prom+1)) + ggtitle("Gene promoters (long ncRNA)") +
+  geom_boxplot() + facet_grid(~Cell) + scale_y_log10("DSBs burden at gene promoter (CPM+1)") +
+  annotate("text", x = -Inf, y = Inf, vjust=1.5, hjust=-0.2, label=paste("N =", pl[, length(unique(gene_id))]), size=3) + xlab("Expression quartile") + stat_compare_means(ref.group="Q1", label="p.signif") +
+  theme_few()
+gg2 = ggplot(pl[BLISS_body<10,], aes(x=quartile, y=BLISS_body+1)) + ggtitle("Gene body (long ncRNA)") +
+  geom_boxplot() + facet_grid(~Cell) + scale_y_log10("DSBs burden in gene (CPKM+1)") +
+  annotate("text", x = -Inf, y = Inf, vjust=1.5, hjust=-0.2, label=paste("N =", pl[, length(unique(gene_id))]), size=3) + xlab("Expression quartile") + stat_compare_means(ref.group="Q1", label="p.signif") +
+  theme_few()
+gg3 = ggplot(pl[BLISS_body<10,], aes(x=quartile, y=BLISS_body+1)) + ggtitle("Gene body (long ncRNA) - ZoomIn") +
+  geom_boxplot() + facet_grid(~Cell) + scale_y_log10("DSBs burden in gene (CPKM+1)") +
+  annotate("text", x = -Inf, y = Inf, vjust=1.5, hjust=-0.2, label=paste("N =", pl[, length(unique(gene_id))]), size=3) + xlab("Expression quartile") + stat_compare_means(ref.group="Q1", label="p.signif") +
+  theme_few() + coord_cartesian(ylim=c(1, 1.5))
+ggB = ggarrange(gg1, gg2, gg3, ncol=1)
+
+gg = ggarrange(ggA, ggB, ncol=2)
+
+save_and_plot(gg, bname="BLISS_promoters_genebody_expressed_genes", dpi=300, use.cowplot=TRUE, ncol=6, nrow=3, base_height=5, base_aspect_ratio = 1.1, 
+              formats = c("png", "pdf"))
+```
+
+### CpG
+
+```{r Rosetta_CpG}
+CpGs = with(fread(file.path(annotation.folder, "UCSC.hg19.CpGislands.tsv"), header=TRUE), GRanges(chrom, IRanges(chromStart, chromEnd)))
+CpGs = keepSeqlevels(CpGs, chromosomes, pruning.mode = "coarse")
+
+rosettaTable = lapply(rosettaTable,
+                      function(x)
+                        x[, CpGisland := overlapsAny(promoters(GRanges(.SD), upstream = 5e3, downstream = 5e3), CpGs)])
+```
+
+```{r RNAseq_and_BLISS_CpGislands}
+expressed = rbindlist(rosettaTable)[, .(E=sum(expression)), by="gene_id"][E>0, gene_id]
+
+pl = rbindlist(lapply(rosettaTable,
+            function(x)
+              x[biotype=="protein_coding" & gene_id%in%expressed,]), idcol="Cell")
+pl[, Cell := factor(Cell, levels=names(rosettaTable))]
+
+gg1 = ggplot(pl, aes(x=CpGisland, y=expression, fill=CpGisland)) +
+  geom_boxplot() +
+  scale_y_log10("Gene expression (TPM)") +
+  scale_fill_jco() +
+  facet_grid(~Cell) +
+  stat_compare_means(ref.group="FALSE", label="p.signif") +
+  theme_few() + xlab("CpG island at promoter") +
+  guides(fill="none")
+
+
+gg2 = ggplot(pl, aes(x=CpGisland, y=BLISS_prom+1, fill=CpGisland)) +
+  geom_boxplot() +
+  scale_y_log10("DSBs burden at gene promoter (CPM+1)") +
+  scale_fill_jco() +
+  facet_grid(~Cell) +
+  stat_compare_means(ref.group="FALSE", label="p.signif") +
+  theme_few() + xlab("CpG island at promoter") +
+  guides(fill="none")
+gg = ggarrange(gg1, gg2, ncol=2)
+
+save_and_plot(gg, bname="RNAseq_and_BLISS_CpGislands", dpi=300, use.cowplot=TRUE, ncol=6, nrow=2, base_height=4, base_aspect_ratio = 0.75, 
+              formats = c("png", "pdf"))
+```
+
+```{r metaprofile_CpGislands}
+annoSel = GRanges(gene.metadata[gene_id%in%rbindlist(rosettaTable)[biotype=="protein_coding" & expression>=1, unique(gene_id)],])
+annoSel$CpGisland = ifelse(overlapsAny(promoters(annoSel, upstream = 2e3, downstream = 1e3), CpGs), "present", "absent")
+
+tab = as.data.table(table(annoSel$CpGisland))
+setnames(tab, "V1", "CpGisland")
+setkey(tab, CpGisland)
+
+annoSel = split(annoSel, annoSel$CpGisland)
+
+pl = rbindlist(lapply(annoSel,
+                      function(sel){
+                        rbindlist(lapply(BLISS_pooled,
+                                         function(x){
+                                           set.seed(42)
+                                           tmp = sample(x, 1.5e7)
+                                           tmp$score = 1/15
+                                           tmp = subsetByOverlaps(tmp, promoters(sel, upstream = 5000, downstream = 5000))
+                                           data.table(binOverFeature(tmp, annotationData=sel,
+                                                                     radius=5000, nbins=50, FUN=sum, errFun=0, minGeneLen=1e3), keep.rownames = "pos")
+                                         }), idcol="Sample")
+                      }), idcol="CpGisland")
+
+pl[, `:=`(CpGisland = factor(CpGisland, levels=unique(CpGisland)),
+          Sample = factor(Sample, levels=names(BLISS_pooled)))]
+
+setkey(pl, CpGisland)
+pl[tab, N := N]
+
+gg = ggplot(pl, aes(x=as.numeric(pos), y=tmp/N, col=Sample)) +
+  ggtitle("DSBs around TSS of expressed protein-coding genes (expression >= 1 TPM)") + 
+  geom_line() + scale_colour_lancet(name="BLISS", alpha=0.75) +
+  scale_x_continuous("Distance from TSS") +
+  scale_y_continuous("BLISS Peaks Density") +
+  geom_text(data=tab, aes(label=paste("N =", N)), x=Inf, y=Inf, hjust=1.2, vjust=1.5, inherit.aes = FALSE, size=4) +
+  facet_grid(~CpGisland, labeller = label_both) +
+  theme_few() + theme(legend.position="bottom")
+ggsave(gg, filename = file.path(png.folder, "BLISS_peaks_distanceToTSS_protein-coding_CpGisland_expressed.png"),
+       units = "in", width = 10, height = 6, dpi = 300)
+ggsave(gg, filename = file.path(pdf.folder,"BLISS_peaks_distanceToTSS_protein-coding_CpGisland_expressed.pdf"),
+       width = 10, height = 6, device=cairo_pdf)
+```
+
+```{r BLISS_CpGislands_Promoter_Body}
+annoSel = unlist(GRangesList(annoSel), use.names = FALSE)
+annoSel = annoSel[width(annoSel)>2e3,]
+
+dt = lapply(BLISS_pooled,
+            function(x){
+              tmp = sample(x, 1.5e7)
+              data.table(data.table(as.data.frame(annoSel))[, .(gene_id, CpGisland, Width=width)],
+                         P = countOverlaps(promoters(annoSel, upstream = 2e3, downstream = 1e3), GRanges(tmp))/3e3*1e3,
+                         B = countOverlaps(resize(annoSel, width = width(annoSel)-1e3, fix = "end"), GRanges(tmp))/width(annoSel)*1e3)
+            })
+dt = rbindlist(dt, idcol="Sample")
+dt[, Sample := factor(Sample, levels=rev(names(BLISS_pooled)))]
+dt[, log2PB := log2((P+1)/(B+1))][, DSB_ratio_bin := cut(log2PB, breaks=c(-Inf, -1, 0, 1, Inf), labels=c("A", "B", "C", "D"))]
+
+gg = ggplot(dt, aes(x=factor(Sample, levels=names(BLISS_pooled)), y=log2PB,
+               fill=factor(Sample, levels=names(BLISS_pooled)))) +
+  geom_hline(yintercept = seq(-1, 1, 1), linetype="dashed") +
+  geom_violin() +
+  geom_boxplot(width=0.2, fill="white", outlier.colour = NA) +
+  scale_fill_lancet(alpha=0.5, name="Cell") +
+  theme_pubr() + labs(x="", y="Promoter over gene body\nDSB ratio")
+ggsave(gg, filename = file.path(pdf.folder,"BLISS_protein-coding_expression_CpGisland_PBratio_scheme.pdf"),
+       width = 6, height = 8, device=cairo_pdf)
+
+pl = dt[, .(N=length(unique(gene_id))), by=c("Sample", "CpGisland", "DSB_ratio_bin")]
+pl[, Sample := factor(Sample, levels=names(BLISS_pooled))][, CpGisland := factor(CpGisland, levels=c("present", "absent"))]
+tab = rbindlist(lapply(setNames(combn(names(BLISS_pooled), 2, simplify = FALSE), sapply(combn(names(BLISS_pooled), 2, simplify = FALSE), function(n) paste(n, collapse="_"))), function(x) rbindlist(lapply(pl[, unique(DSB_ratio_bin)], function(y){ tmp=data.frame(dcast.data.table(pl[DSB_ratio_bin==y & Sample%in%x,], Sample~CpGisland, value.var = "N"), row.names = 1); print(tmp); data.table(DSB_ratio_bin = y, Pval = fisher.test(tmp)$p.value) }))), idcol="Comparison")
+gg = ggplot(pl[, .(N = sum(N)), by=c("Sample", "DSB_ratio_bin")], aes(x=Sample, y=N, fill=DSB_ratio_bin)) + geom_bar(stat="identity", position="dodge", col="black") + scale_fill_jco() + theme_bw()
+ggsave(gg, filename = file.path(png.folder, "BLISS_protein-coding_expression_CpGisland_PBratio_barplot.png"),
+       units = "in", width = 8, height = 4, dpi = 300)
+ggsave(gg, filename = file.path(pdf.folder,"BLISS_protein-coding_expression_CpGisland_PBratio_barplot.pdf"),
+       width = 8, height = 4, device=cairo_pdf)
+fwrite(tab, file="BLISS_protein-coding_expression_CpGisland_PBratio_barplot.tsv", quote = FALSE, sep = "\t", row.names = FALSE, col.names = TRUE)
+
+setkeyv(dt, c("Sample", "gene_id"))
+dt[expr_tpm, expression := value]
+
+tab = dcast.data.table(dt, Sample+gene_id+DSB_ratio_bin~CpGisland, value.var = "Width")[, .(Pval=wilcox.test(.SD[!is.na(present), present], .SD[!is.na(absent), absent])$p.value), by=c("Sample", "DSB_ratio_bin")]
+tab[, symbol := symnum(Pval, cutpoints = c(0, 0.0001, 0.001, 0.01, 0.05, 1), symbols = c("****", "***", "**", "*", "ns"))]
+tab[, CpGisland := as.factor("present")][, Width := Inf]
+
+gg1 = ggplot(dt, aes(x=as.factor(CpGisland), y=Width/1e3)) + 
+  geom_boxplot(notch=TRUE) +
+  scale_x_discrete("Promoter contains CpG island") +
+  scale_y_log10("Gene width (kb)") +
+  geom_text(data=tab, aes(label=symbol), vjust=1.2) +
+  facet_grid(Sample~DSB_ratio_bin) +
+  theme_pubr() + guides(fill=guide_legend(title = "Promoter over gene body\nDSB ratio", reverse = TRUE))
+
+tab = dcast.data.table(dt, Sample+gene_id+DSB_ratio_bin~CpGisland, value.var = "expression")[, .(Pval=wilcox.test(.SD[!is.na(present), present], .SD[!is.na(absent), absent])$p.value), by=c("Sample", "DSB_ratio_bin")]
+tab[, symbol := symnum(Pval, cutpoints = c(0, 0.0001, 0.001, 0.01, 0.05, 1), symbols = c("****", "***", "**", "*", "ns"))]
+tab[, CpGisland := as.factor("present")][, expression := Inf]
+
+gg2 = ggplot(dt, aes(x=CpGisland, y=expression+1)) + 
+  geom_boxplot(notch=TRUE) +
+  scale_x_discrete("Promoter contains CpG island") +
+  scale_y_log10("TPM Expression") +
+  geom_text(data=tab, aes(label=symbol), vjust=1.2) +
+  facet_grid(Sample~DSB_ratio_bin) +
+  theme_pubr() + guides(fill=guide_legend(title = "Promoter over gene body\nDSB ratio", reverse = TRUE))
+gg = ggarrange(gg1, gg2, nrow = 2, common.legend = TRUE, legend = "right")
+
+ggsave(gg, filename = file.path(png.folder, "BLISS_protein-coding_expression_CpGisland_PBratio.png"),
+       units = "in", width = 14, height = 12, dpi = 300)
+ggsave(gg, filename = file.path(pdf.folder,"BLISS_protein-coding_expression_CpGisland_PBratio.pdf"),
+       width = 14, height = 12, device=cairo_pdf)
+```
+
+### HiC
+
+```{r Eigenvectors}
+# Correction
+dt = list(first = rbindlist(list(NES = fread(file.path(hic.folder, "NES_1Mb_eigenvectors.bed")),
+                                 NPC = fread(file.path(hic.folder, "NPC_1Mb_eigenvectors.bed")),
+                                 NEU = fread(file.path(hic.folder, "NEU_1Mb_eigenvectors.bed"))), idcol="Cell"),
+          second = rbindlist(list(NES = fread(file.path(hic.folder, "NES_1Mb_eigenvectors_2.bed")),
+                                  NPC = fread(file.path(hic.folder, "NPC_1Mb_eigenvectors_2.bed")),
+                                  NEU = fread(file.path(hic.folder, "NEU_1Mb_eigenvectors_2.bed"))), idcol="Cell"))
+
+# Choose the best eigenvector
+eigen = data.table()
+for( x in c("NES", "NPC", "NEU") ){
+  for( y in chromosomes ){
+    ref = with(dt[[1]][Cell!=x & V1==y,], split(V5, Cell))
+    eig1 = dt[[1]][Cell==x & V1==y,]
+    eig2 = dt[[2]][Cell==x & V1==y,]
+    cond = sum(sapply(ref, function(r) abs(cor(eig1[, V5], r))) - sapply(ref, function(r) abs(cor(eig2[, V5], r))) > 0)
+    if( cond >= 1 ){
+      eigen = rbindlist(list(eigen, eig1))
+    } else {
+      eigen = rbindlist(list(eigen, eig2))
+    }
+  }
+}
+```
+
+```{r AB_by_RNAseq, eval=FALSE}
+# This code is not executed because it would required the mapped (.bam) RNA-seq files
+# However, it was not removed from the code to show what was done at this point
+rna.files = list.files(file.path(rnaseq.folder, "picarded"), pattern="bam$", full.names = TRUE)
+names(rna.files) = as.data.table(tstrsplit(basename(rna.files), "_")[5:6])[, paste(V1, V2, sep="_")]
+names(rna.files) = gsub("W2", "NEU", gsub("P2", "NPC", gsub("N2", "NES", names(rna.files))))
+
+if( !file.exists(file.path(rnaseq.folder, "Binned_RNAseq_10kb.rds")) ){
+  if( !file.exists(file.path(rnaseq.folder, "ALL_RNAseq_reads.rds")) ){
+    param = ScanBamParam(flag=scanBamFlag(isPaired = FALSE, isUnmappedQuery=FALSE, isSecondaryAlignment = FALSE))
+    RNA_data = pblapply(rna.files,
+                        function(x){
+                          bam = readGAlignments(x, param=param)
+                          bam = invertStrand(bam)
+                          bam = keepSeqlevels(bam, chromosomes, pruning.mode = "coarse")
+                          bam = subsetByOverlaps(bam, GRanges(blacklist), invert = TRUE)
+                          return(bam)
+                        })
+    saveRDS(RNA_data, file=file.path(hic.folder, "RData", "ALL_RNAseq_reads.rds"))
+  }else{
+    RNA_data = readRDS(file.path(hic.folder, "RData", "ALL_RNAseq_reads.rds"))
+  }
+  
+  genome_tiles = unlist(slidingWindows(GRanges(chrom_sizes), width = 1e4, step = 1e4))
+  RNAseq_10kb = sapply(RNA_data,
+                       function(x)
+                         countOverlaps(genome_tiles, promoters(GRanges(x), upstream = 0, downstream = 1))/length(x)*1e6)
+  RNAseq_10kb = list(NES = data.table(as.data.frame(genome_tiles, row.names = NULL),
+                                      score = rowMeans(RNAseq_10kb[, 1:3])),
+                     NPC = data.table(as.data.frame(genome_tiles, row.names = NULL),
+                                      score = rowMeans(RNAseq_10kb[, 4:6])),
+                     NEU = data.table(as.data.frame(genome_tiles, row.names = NULL),
+                                      score = rowMeans(RNAseq_10kb[, 7:9])))
+  saveRDS(RNAseq_10kb, file = file.path(rnaseq.folder, "Binned_RNAseq_10kb.rds"))
+}else{
+  RNAseq_10kb = readRDS(file.path(rnaseq.folder, "Binned_RNAseq_10kb.rds"))
+}
+```
+
+```{r AB_Orientation}
+RNAseq_10kb = readRDS(file.path(rnaseq.folder, "Binned_RNAseq_10kb.rds"))
+
+hic_eigen = lapply(setNames(c("NES", "NPC", "NEU"), c("NES", "NPC", "NEU")),
+                   function(x){
+                     tmp = eigen[Cell==x,]
+                     overlaps = as.data.table(findOverlaps(tmp[, GRanges(V1, IRanges(V2, V3))],
+                                                           GRanges(RNAseq_10kb[[x]])))
+                     overlaps[, score := RNAseq_10kb[[x]][subjectHits, score]]
+                     overlaps = overlaps[, .(score = sum(score)), by="queryHits"]
+                     with(overlaps, tmp[queryHits, score := score])
+                     return(tmp)
+                   })
+
+hic_eigen = lapply(hic_eigen,
+                   function(x){
+                     tmp = copy(x)
+                     tmp[, Comp := ifelse(.SD[V5>0, mean(score)]/.SD[V5<0, mean(score)] > 1, TRUE, FALSE), by="V1"]
+                     tmp[Comp==TRUE, Oriented := V5][Comp==FALSE, Oriented := -V5]
+                     return(tmp[, .(Cell, chrom=V1, start=V2, end=V3, name=V4, Original=V5, Oriented, Expression=score)])
+                   })
+```
+
+```{r AB_BLISS}
+hic_eigen = lapply(hic_eigen, function(x) x[, name := ifelse(Oriented>0, "A", "B")])
+
+pl = rbindlist(lapply(setNames(c("NES", "NPC", "NEU"), c("NES", "NPC", "NEU")),
+                      function(x){
+                        tmp = hic_eigen[[x]][, .(seqnames=chrom, start, end, Compartment=name)]
+                        data.table(tmp, DSBs = countOverlaps(GRanges(tmp),
+                                                             BLISS_pooled[[x]])/length(BLISS_pooled[[x]])*1e6)
+                      }), idcol="Cell")
+
+pl[, `:=`(Cell = factor(Cell, levels=names(BLISS_pooled)), Compartment = factor(Compartment, levels = c("A", "B")))]
+
+gg = ggplot(pl, aes(x=Compartment, y=DSBs, fill=Compartment)) +
+  geom_violin(trim=TRUE) + geom_boxplot(outlier.colour = NA, fill="white", width=0.2) +
+  scale_y_continuous("DSBs per 1Mb genomic bins (CPM)") +
+  scale_fill_nejm(name="Compartment", guide="none") +
+  facet_grid(~Cell) +
+  theme_few() +
+  stat_compare_means(comparisons = combn(c("A", "B"), 2, simplify = FALSE), label="p.signif")
+save_and_plot(gg, bname="HiC_compartements_BLISS", formats = c("png", "pdf"),
+              dpi=300, use.cowplot = TRUE, ncol = 3, nrow = 1, base_height = 5, base_aspect_ratio = 0.75)
+```
+
+```{r TADs_FANC_BLISS}
+# TADs
+tads = list.files(hic.folder, pattern="_insulation_25kb.bed", full.names = TRUE)
+names(tads) = tstrsplit(basename(tads), "_")[[1]]
+
+tads = lapply(tads, function(x) fread(x, header=FALSE)[, .(seqnames=V1, start=V2, end=V3, score=V5)])
+
+tads = lapply(tads,
+              function(x){
+                tmp = rbindlist(split(x[is.finite(score),], x[is.finite(score), score>0]), idcol="TAD")
+                tmp[TAD==TRUE, region := factor("intraTAD", levels=c("intraTAD", "interTADs"))]
+                tmp[TAD==FALSE, region := "interTADs"]
+                tmp[, .(seqnames, start, end, score, region)]
+              })
+
+tads = rbindlist(tads, idcol="Cell")
+
+tads[, seqnames := factor(seqnames, levels=chromosomes)]
+tads = tads[!is.na(seqnames),]
+
+tads_gr = GRanges(tads)
+ggl = rbindlist(lapply(BLISS_pooled,
+                       function(x){
+                         tmp = data.table(as.data.frame(tads_gr), DSBs = countOverlaps(tads_gr, x)/length(x)*1e6)
+                         tmp[, .(DSBs = sum(DSBs)/sum(width)*1e3, DSBsNoEmpty = .SD[DSBs>0, sum(DSBs)/sum(width)*1e3]),
+                             by=c("Cell", "region")]
+                       }), idcol="BLISS")
+
+pl = dcast.data.table(ggl, Cell+BLISS~region, value.var = "DSBs")[Cell==BLISS,]
+pl[, `:=`(log2FC = log2(intraTAD/interTADs),
+          Cell = factor(Cell, levels=c("NES", "NPC", "NEU")),
+          BLISS = factor(BLISS, levels = c("NES-Britta", "NES", "NPC", "NEU")))]
+
+gg = ggplot(pl, aes(x=Cell, y=log2FC, fill=BLISS)) +
+  ggtitle("Intra- over inter-TADs DSB ratio") +
+  geom_bar(position="dodge", stat="identity", col="black", size=0.25) +
+  scale_x_discrete("") +
+  scale_y_continuous(expression("Normalised DSB ratio (log"[2]*")")) +
+  scale_fill_lancet(alpha=0.75) +
+  theme_pubr()
+save_and_plot(gg, bname="BLISS_HiC_insulation", dpi=300, height=8, width = 6)
+```
+
+```{r TADs_FANC_BLISS_metaplot}
+# TAD boundaries
+boundaries = list.files(hic.folder, pattern="_insulation_boundaries_25kb.bed", full.names = TRUE)
+names(boundaries) = tstrsplit(basename(boundaries), "_")[[1]]
+
+boundaries = lapply(boundaries, function(x) fread(x, header=FALSE)[, .(seqnames=V1, start=V2, end=V3, score=V5)])
+
+boundaries = list(NES = data.table(as.data.frame(subsetByOverlaps(GRanges(boundaries[["NES"]]),
+                                                                  resize(GRanges(rbindlist(boundaries[c("NPC", "NEU")])),
+                                                                         width(GRanges(rbindlist(boundaries[c("NPC", "NEU")])))*3,
+                                                                         fix="center"), invert = TRUE))),
+                  NPC = data.table(as.data.frame(subsetByOverlaps(GRanges(boundaries[["NPC"]]),
+                                                                  resize(GRanges(rbindlist(boundaries[c("NES", "NEU")])),
+                                                                         width(GRanges(rbindlist(boundaries[c("NES", "NEU")])))*3,
+                                                                         fix="center"), invert = TRUE))),
+                  NEU = data.table(as.data.frame(subsetByOverlaps(GRanges(boundaries[["NEU"]]),
+                                                                  resize(GRanges(rbindlist(boundaries[c("NPC", "NES")])),
+                                                                         width(GRanges(rbindlist(boundaries[c("NPC", "NES")])))*3,
+                                                                         fix="center"), invert = TRUE))))
+
+boundaries = rbindlist(boundaries, idcol="Cell")
+
+boundaries[, seqnames := factor(seqnames, levels=chromosomes)]
+boundaries = boundaries[!is.na(seqnames),]
+
+boundaries_gr = GRanges(boundaries)
+boundaries_gr = resize(boundaries_gr, width=width(boundaries_gr)*20, fix ="center")
+cell_group = boundaries_gr$Cell
+boundaries_gr = slidingWindows(boundaries_gr, width = 1e3, step = 1e3)
+names(boundaries_gr) = paste(cell_group, seq_along(boundaries_gr), sep="_")
+boundaries_gr = unlist(boundaries_gr, use.names = TRUE)
+boundaries_gr$name = names(boundaries_gr)
+names(boundaries_gr) = NULL
+
+ggl = rbindlist(lapply(BLISS_pooled,
+                       function(x){
+                         set.seed(42)
+                         tmp = sample(x, 1.5e7)
+                         data.table(as.data.frame(boundaries_gr),
+                                    DSBs = countOverlaps(boundaries_gr, tmp)/length(tmp)*1e6)
+                         }), idcol="BLISS")
+
+ggl[, c("HiC", "Id") := tstrsplit(name, "_")]
+ggl[, Dens := DSBs/sum(DSBs), by=c("BLISS", "name")][!is.finite(Dens), Dens := 0]
+
+pl = ggl[HiC==BLISS,]
+pl[, Pos := seq_along(seqnames), by=c("BLISS", "name")]
+pl[, `:=`(HiC = factor(HiC, levels=c("NES", "NPC", "NEU")),
+          BLISS = factor(BLISS, levels = c("NES", "NPC", "NEU")))]
+
+pl = pl[, .(Mean = mean(Dens), Median = median(Dens)), by=c("BLISS", "HiC", "Pos")]
+
+gg1 = ggplot(pl, aes(x=as.numeric(Pos), y=Mean, col=BLISS)) +
+  ggtitle("DSBs across and around TAD boundaries (Raw)") +
+  geom_rect(xmin=95, xmax=105, ymin=-Inf, ymax=Inf, col=NA, fill="grey90") +
+  geom_line(size=0.75) +
+  scale_x_continuous("", breaks=c(1, 100.5, 200), labels=c("-100kb", "Boundary", "+100kb")) +
+  scale_y_continuous("Average DSBs density") +
+  scale_colour_lancet(alpha=0.75) +
+  theme_few()
+
+gg2 = ggplot(pl, aes(x=as.numeric(Pos), y=Mean, col=BLISS)) +
+  ggtitle("DSBs across and around TAD boundaries (Smooth)") +
+  geom_rect(xmin=95, xmax=105, ymin=-Inf, ymax=Inf, col=NA, fill="grey90") +
+  # geom_line(size=0.75) +
+  geom_smooth(se = FALSE, span=0.2) +
+  scale_x_continuous("", breaks=c(1, 100.5, 200), labels=c("-100kb", "Boundary", "+100kb")) +
+  scale_y_continuous("Average DSBs density") +
+  scale_colour_lancet(alpha=0.75) +
+  theme_few()
+
+gg = ggarrange(gg1, gg2, ncol=2, common.legend = TRUE)
+
+save_and_plot(gg, bname="HiC_insulation_boundaries_BLISS_metaplot", dpi=300, use.cowplot=TRUE, ncol=2, nrow=1,
+              base_height=5, base_aspect_ratio = 1.25)
+```
+
+```{r Loops_Juicer_metaprofiles}
+file_list = list.files(hic.folder, pattern = "merged_loops.bedpe", full.names = TRUE)
+names(file_list) = tstrsplit(basename(file_list), "_")[[1]]
+
+loops = lapply(file_list, function(x) fread(x, skip=2, header=FALSE)[, .(seqnames=V1, start=V22, end=V23, score=V12)])
+loops = rbindlist(loops, idcol="name")
+
+loops[, seqnames := factor(seqnames, levels=chromosomes)]
+loops = loops[!is.na(seqnames),]
+
+loops = GRanges(loops)
+
+ctcf = GRanges(fread(file.path(annotation.folder, "UCSC.hg19.CTCF.sites.bed"),
+                     col.names = c("seqnames", "start", "end", "name")))
+
+loops$startToCTCF = mcols(distanceToNearest(resize(loops, 1, fix="start"), ctcf))$distance
+loops$endToCTCF   = mcols(distanceToNearest(resize(loops, 1, fix="end"), ctcf))$distance
+
+# BLISS
+pl = rbindlist(lapply(BLISS_pooled,
+                      function(x){
+                        set.seed(42)
+                        tmp = sample(x, 1.5e7)
+                        loops_start = shift(resize(loops, 5e4, fix="start"), -2.5e4)
+                        overlaps = as.data.table(findOverlaps(loops_start, tmp))
+                        tmp1 = with(overlaps, data.table(data.table(as.data.frame(loops))[, data.table(.SD, N=.N),
+                                                                                          by="name"][queryHits,],
+                                                         dist = distance(resize(loops_start, 1, fix="start")[queryHits,],
+                                                                         tmp[subjectHits,])-2.5e4))
+                        loops_end = shift(resize(loops, 5e4, fix="end"), 2.5e4)
+                        overlaps = as.data.table(findOverlaps(loops_end, tmp))
+                        tmp2 = with(overlaps, data.table(data.table(as.data.frame(loops))[, data.table(.SD, N=.N),
+                                                                                          by="name"][queryHits,],
+                                                         dist = distance(resize(loops_end, 1, fix="start")[queryHits,],
+                                                                         tmp[subjectHits,])-2.5e4))
+                        
+                        tmp = rbindlist(list(Start=tmp1, End=tmp2), idcol="pos")
+                        tmp[, bin := as.numeric(as.character(cut(dist, breaks = seq(-2.5e4, 2.5e4, length.out=51),
+                                                                 labels = c(-25:-1, 1:25), include.lowest = TRUE)))]
+                        tmp = tmp[, .(Count = .N), by=c("pos", "name" , "N", "bin")]
+                        tmp[, Density := Count/N]
+                        tmp[, `:=`(pos = factor(pos, levels=c("Start", "End")),
+                                   name = factor(name, levels=c("NES", "NPC", "NEU")))]
+                        return(tmp)
+                      }), idcol="BLISS")
+
+pl = pl[BLISS==name,]
+pl[, Enrichment := Density/min(Density), by=c("BLISS", "name")]
+pl = pl[, .(Enrichment = mean(Enrichment)), by=c("BLISS", "pos", "name", "bin")]
+gg = ggplot(pl, aes(x=bin, y=log2(Enrichment), col=name)) +
+  geom_hline(yintercept = 0, col="grey75") +
+  geom_vline(xintercept = 0, col="grey75", linetype="dashed") +
+  geom_line() +
+  scale_x_continuous(breaks=seq(-25, 25, 5)) + 
+  xlab("Loop anchor(s) distance to DSBs (kb)") + ylab("Enrichment over baseline (log2)") +
+  scale_colour_lancet(alpha = 0.75) +
+  facet_grid(~pos) + theme_few() + guides(colour=guide_legend(title="BLISS"))
+save_and_plot(gg, bname = "HiC_loops_BLISS", use.cowplot = FALSE, dpi = 300, width = 8, height = 4, formats = c("png", "pdf"))
+
+# BLISS and CTCF
+pl = rbindlist(lapply(BLISS_pooled,
+                      function(x){
+                        set.seed(42)
+                        tmp = sample(x, 1.5e7)
+                        ctcf_motif = resize(ctcf, 5e4, fix="center")
+                        overlaps = as.data.table(findOverlaps(ctcf_motif, x))
+                        tmp = with(overlaps, data.table(as.data.table(as.data.frame(ctcf_motif))[, data.table(.SD, N=.N)][queryHits,],
+                                                        dist = distance(resize(ctcf_motif, 1, fix="start")[queryHits,],
+                                                                        x[subjectHits,])-2.5e4))
+                        tmp[, bin := as.numeric(as.character(cut(dist, breaks = seq(-2.5e4, 2.5e4, length.out=51),
+                                                                 labels = c(-25:-1, 1:25), include.lowest = TRUE)))]
+                        tmp = tmp[, .(Count = .N), by=c("N", "bin")]
+                        tmp[, Density := Count/N]
+                        return(tmp)
+                      }), idcol="BLISS")
+
+pl[, Enrichment := Density/min(Density), by="BLISS"]
+pl = pl[, .(Density = mean(Density), Enrichment = mean(Enrichment)), by=c("BLISS", "bin")]
+pl[, `:=`(BLISS = factor(BLISS, levels=c("NES", "NPC", "NEU")))]
+
+gg = ggplot(pl, aes(x=bin, y=log2(Enrichment), col=BLISS)) +
+  geom_hline(yintercept = 0, col="grey75") +
+  geom_vline(xintercept = 0, col="grey75", linetype="dashed") +
+  geom_line() +
+  scale_x_continuous(breaks=c(seq(-25, 25, 5))) + 
+  xlab("DSBs distance to CTCF motif (kb)") + ylab("Enrichment over baseline (log2)") +
+  scale_colour_lancet(alpha = 0.75) +
+  theme_few() + theme(legend.position="bottom")
+save_and_plot(gg, bname = "CTCF_and_BLISS", use.cowplot = TRUE, dpi = 300, base_height = 5, base_aspect_ratio = 1.5,
+              formats = c("png", "pdf"))
+```
+
+### Literature
+
+```{r Genes_from_literature}
+gene_set = GRanges(gene.metadata[gene_type=="protein_coding" & seqnames%in%chromosomes & !is.na(entrez_id),])
+
+gene_files = list.files("data/GeneLists/", pattern=".tsv")
+
+gene_files = setNames(gene_files, gsub("(-|_)?genes", "", gsub("\\.tsv", "", gene_files)))
+
+geneLists = rbindlist(lapply(gene_files, function(x){
+  tmp = fread(file.path("data/GeneLists/", x), header=TRUE, select = 1:2)
+  tmp = tmp[, .(gene_name = unique(gene)), by="group"]
+  tmp = tmp[, as.list(AnnotationDbi::select(org.Hs.eg.db, keys=unique(toupper(gene_name)), keytype="SYMBOL",
+                                  columns=c("SYMBOL", "ENTREZID"), multiVals = "first")), by="group"]
+  tmp = tmp[!is.na(ENTREZID), .(ENTREZID = as.character(unique(ENTREZID))), by="group"]
+  return(tmp[ENTREZID%in%gene_set$entrez_id,])
+}), idcol="Dataset")
+
+geneLists[, group := gsub("scz-", "", gsub("asd", "all", group))]
+geneLists[, c("A", "B", "C") := tstrsplit(Dataset, "_")]
+geneLists = with(geneLists, split(ENTREZID, paste(B, C, gsub("-all", "", paste(A, group, sep="-")), sep="_")))
+
+geneLists = rbindlist(lapply(geneLists, as.data.table), idcol="name")
+geneLists[, name := gsub("-.*$", "", name)]
+geneLists = lapply(with(geneLists, split(V1, name)), unique)
+
+gene_files = grep("(Zarrei|Fromer|Liang)", 
+                  list.files("data/GeneLists/", pattern=".txt"),
+                       value = TRUE, invert = TRUE)
+
+gene_files = setNames(gene_files, gsub("\\.txt", "", gene_files))
+
+geneListsAdd = lapply(gene_files, function(x){
+  tmp = fread(file.path("data/GeneLists/", x), header=FALSE)[, .(gene_name = unique(V1))]
+  tmp = as.data.table(AnnotationDbi::select(org.Hs.eg.db, keys=tmp[, toupper(gene_name)], keytype="SYMBOL", columns=c("SYMBOL", "ENTREZID"), multiVals = "first"))
+  return(tmp[!is.na(ENTREZID), as.character(unique(ENTREZID))])
+})
+
+geneListsAdd = rbindlist(lapply(geneListsAdd, as.data.table), idcol="name")
+geneListsAdd[, c("Author", "Year") := tstrsplit(name, "_")[1:2]]
+geneListsAdd = lapply(with(geneListsAdd, split(V1, paste(Author, Year, sep="_"))), unique)
+
+geneLists = c(geneLists, geneListsAdd)
+
+rosettaTable = lapply(rosettaTable,
+                      function(x)
+                        x[, exprDecile := findInterval(expression,
+                                                       quantile(expression, seq(0, 1, 0.1)), all.inside = TRUE)])
+
+pl = rbindlist(lapply(setNames(seq_along(geneLists), names(geneLists)),
+                      function(i){
+                        ref = setdiff(gene_set$entrez_id, geneLists[[i]])
+                        ref = data.table(Category="Background",
+                                         rbindlist(lapply(rosettaTable,
+                                                          function(y)
+                                                            y[entrez_id%in%unique(ref),]),
+                                                   idcol="Cell"))
+                        grp = data.table(Category=names(geneLists[i]),
+                                         rbindlist(lapply(rosettaTable,
+                                                          function(y)
+                                                            y[entrez_id%in%geneLists[[i]],]),
+                                                   idcol="Cell"))
+                                         tmp = rbindlist(list(ref, grp))
+                                         return(tmp)
+                      }), idcol="Group")
+pl[, Cell := factor(Cell, levels=c("NES", "NPC", "NEU"))]
+
+gg1 = ggplot(pl[grepl("scz", Group),], aes(x=Category, y=expression+1, fill=Category)) + geom_boxplot(notch=TRUE) + scale_y_log10() + scale_fill_npg(guide="none") + facet_wrap(~Cell, scales="free_x") + theme_few() + stat_compare_means(ref.group = "Background", label="p.signif") + labs(x="", y="Expression (TPM+1)")
+gg2 = ggplot(pl[grepl("asd", Group),], aes(x=Category, y=expression+1, fill=Category)) + geom_boxplot(notch=TRUE) + scale_y_log10() + scale_fill_npg(guide="none") + facet_wrap(~Cell, scales="free_x") + theme_few() + stat_compare_means(ref.group = "Background", label="p.signif") + labs(x="", y="Expression (TPM+1)")
+gg = ggarrange(gg1, gg2, nrow=2)
+save_and_plot(gg, bname="MultiDataset_Categories_NicolaLiterature_Expression", formats = c("png", "pdf"),
+              width = 8, height = 8, dpi=300, use.cowplot=FALSE)
+
+ggl = lapply(pl[, unique(Group)],
+             function(x){
+               tmp = pl[Group == x,]
+               tmp[,`:=`(Cell = factor(Cell, levels=c("NES", "NPC", "NEU")),
+                                         Category = factor(Category, levels=unique(Category)))]
+               
+               ggplot(tmp, aes(x=Category, y=BLISS_prom)) +
+                 geom_boxplot(notch=FALSE) +
+                 scale_x_discrete("") + scale_y_continuous("DSB burden at gene promoter (CPM)") +
+                 facet_grid(Cell~., scales="free_x") +
+                 theme_few() + theme(axis.text.x=element_text(angle=30, hjust=1)) + coord_cartesian(ylim=c(0, 4)) +
+                 stat_compare_means(ref.group = "Background", label = "p.signif", label.y = 3.8)
+             })
+gg = ggarrange(plotlist=ggl, ncol=length(geneLists), align = "hv")
+save_and_plot(gg, bname="MultiDataset_Categories_NicolaLiterature_DSBpromoter", formats = c("png", "pdf"),
+              width = 16, height = 10, dpi=300, use.cowplot=FALSE)
+
+ggl = lapply(pl[, unique(Group)],
+             function(x){
+               tmp = pl[Group == x,]
+               tmp[,`:=`(Cell = factor(Cell, levels=c("NES", "NPC", "NEU")),
+                                         Category = factor(Category, levels=unique(Category)))]
+               
+               ggplot(tmp, aes(x=Category, y=BLISS_body)) +
+                 geom_boxplot(notch=FALSE) +
+                 scale_x_discrete("") + scale_y_continuous("DSB burden at gene (CPM)") +
+                 facet_grid(Cell~., scales="free_x") +
+                 theme_few() + theme(axis.text.x=element_text(angle=30, hjust=1)) + coord_cartesian(ylim=c(0, 1)) +
+                 stat_compare_means(ref.group = "Background", label = "p.signif", label.y = 0.9)
+             })
+gg = ggarrange(plotlist=ggl, ncol=length(geneLists), align = "hv")
+save_and_plot(gg, bname="MultiDataset_Categories_NicolaLiterature_DSBbody", formats = c("png", "pdf"),
+              width = 16, height = 10, dpi=300, use.cowplot=FALSE)
+
+ggl = lapply(pl[, unique(Group)],
+             function(x){
+               tmp = pl[Group == x,]
+               tmp[,`:=`(Cell = factor(Cell, levels=c("NES", "NPC", "NEU")),
+                                         Category = factor(Category, levels=unique(Category)))]
+               
+               ggplot(tmp, aes(x=Category, y=log10(expression+1))) +
+                 geom_boxplot(notch=FALSE) +
+                 scale_x_discrete("") + scale_y_continuous("Gene expression log10(TPM+1)") +
+                 facet_grid(Cell~., scales="free_x") +
+                 theme_few() + theme(axis.text.x=element_text(angle=30, hjust=1)) +
+                 stat_compare_means(ref.group = "Background", label = "p.signif", label.y.npc = 0.9)
+             })
+gg = ggarrange(plotlist=ggl, ncol=length(geneLists), align = "hv")
+save_and_plot(gg, bname="MultiDataset_Categories_NicolaLiterature_Expression", formats = c("png", "pdf"),
+              width = 16, height = 10, dpi=300, use.cowplot=FALSE)
+```
+
+### Reproducibility
+
+```{r BLISS_binning}
+if( !file.exists(file.path(bliss.folder, "Binned_BLISS_1Mb.rds")) ){
+  BLISS_1Mb = lapply(setNames(c("NES", "NPC", "NEU"), c("NES", "NPC", "NEU")),
+                     function(sample){
+                       query = paste0(sample, "_")
+                       print(grep(query, names(BLISS_data), value=TRUE))
+                       unl = sortSeqlevels(unlist(GRangesList(BLISS_data[grepl(query, names(BLISS_data))])))
+                       genome_tiles = unlist(slidingWindows(GRanges(chrom_sizes), width = 1e6, step = 1e6))
+                       data.table(as.data.frame(genome_tiles, row.names = NULL),
+                                  score = countOverlaps(genome_tiles, unl)/length(unl)*1e6)
+                     })
+  saveRDS(BLISS_1Mb, file = file.path(bliss.folder, "Binned_BLISS_1Mb.rds"))
+}else{
+  BLISS_1Mb = readRDS(file.path(bliss.folder, "Binned_BLISS_1Mb.rds"))  
+}
+if( !file.exists(file.path(bliss.folder, "Binned_BLISS_100kb.rds")) ){
+  BLISS_100kb = lapply(setNames(c("NES", "NPC", "NEU"), c("NES", "NPC", "NEU")),
+                     function(sample){
+                       query = paste0(sample, "_")
+                       print(grep(query, names(BLISS_data), value=TRUE))
+                       unl = sortSeqlevels(unlist(GRangesList(BLISS_data[grepl(query, names(BLISS_data))])))
+                       genome_tiles = unlist(slidingWindows(GRanges(chrom_sizes), width = 1e5, step = 1e5))
+                       data.table(as.data.frame(genome_tiles, row.names = NULL),
+                                  score = countOverlaps(genome_tiles, unl)/length(unl)*1e6)
+                     })
+  saveRDS(BLISS_100kb, file = file.path(bliss.folder, "Binned_BLISS_100kb.rds"))
+}else{
+  BLISS_100kb = readRDS(file.path(bliss.folder, "Binned_BLISS_100kb.rds"))  
+}
+if( !file.exists(file.path(bliss.folder, "Binned_BLISS_10kb.rds")) ){
+  BLISS_10kb = lapply(setNames(c("NES", "NPC", "NEU"), c("NES", "NPC", "NEU")),
+                     function(sample){
+                       query = paste0(sample, "_")
+                       print(grep(query, names(BLISS_data), value=TRUE))
+                       unl = sortSeqlevels(unlist(GRangesList(BLISS_data[grepl(query, names(BLISS_data))])))
+                       genome_tiles = unlist(slidingWindows(GRanges(chrom_sizes), width = 1e4, step = 1e4))
+                       data.table(as.data.frame(genome_tiles, row.names = NULL),
+                                  score = countOverlaps(genome_tiles, unl)/length(unl)*1e6)
+                     })
+  saveRDS(BLISS_10kb, file = file.path(bliss.folder, "Binned_BLISS_10kb.rds"))
+}else{
+  BLISS_10kb = readRDS(file.path(bliss.folder, "Binned_BLISS_10kb.rds"))  
+}
+if( !file.exists(file.path(bliss.folder, "Binned_BLISS_1kb.rds")) ){
+  BLISS_1kb = lapply(setNames(c("NES", "NPC", "NEU"), c("NES", "NPC", "NEU")),
+                     function(sample){
+                       query = paste0(sample, "_")
+                       print(grep(query, names(BLISS_data), value=TRUE))
+                       grl = GRangesList(BLISS_data[grepl(query, names(BLISS_data))])
+                       genome_tiles = unlist(slidingWindows(GRanges(chrom_sizes), width = 1e3, step = 1e3))
+                       counts = sapply(grl, function(x) countOverlaps(genome_tiles, x))
+                       counts = t(t(counts)/colSums(counts))*1e6
+                       data.table(as.data.frame(genome_tiles, row.names = NULL),
+                                  score = rowMeans(counts))
+                     })
+  saveRDS(BLISS_1kb, file = file.path(bliss.folder, "Binned_BLISS_1kb.rds"))
+}else{
+  BLISS_1kb = readRDS(file.path(bliss.folder, "Binned_BLISS_1kb.rds"))  
+}
+```
+
+```{r BLISS_correlations_resolutions}
+# Genome binning
+if( !file.exists(file.path(bliss.folder, "BLISS_resolutions_correlations.rds")) ){
+  pl = lapply(c(1e6, 1e5, 2.5e4, 2e4, 1e4),
+              function(window_size){
+
+                genomic_tiles = tileGenome(seqlengths(chrom_sizes), tilewidth=window_size,
+                                           cut.last.tile.in.chrom=TRUE)
+                # Remove bins that are smaller than window size (i.e., the last bin at the end of each chromosome)
+                genomic_tiles = genomic_tiles[width(genomic_tiles)==window_size]
+
+                cnt = sapply(BLISS_data, function(x) countOverlaps(genomic_tiles, x))
+
+                combinations = combn(seq_len(ncol(cnt)), 2, simplify = FALSE)
+                corP = matrix(as.numeric(NA), nrow = ncol(cnt), ncol = ncol(cnt))
+                corS = matrix(as.numeric(NA), nrow = ncol(cnt), ncol = ncol(cnt))
+
+                for( i in combinations ){
+                  tmp = cnt[, i]
+                  tmp = tmp[rowSums(tmp)>0,]
+                  corP[i[1], i[2]] = cor(tmp[, 1], tmp[, 2], method="pearson",  use="pairwise.complete.obs")
+                  corS[i[1], i[2]] = cor(tmp[, 1], tmp[, 2], method="spearman", use="pairwise.complete.obs")
+                }
+
+                corP = data.frame(corP)
+                rownames(corP) = colnames(cnt)
+                colnames(corP) = colnames(cnt)
+                corS = data.frame(corS)
+                rownames(corS) = colnames(cnt)
+                colnames(corS) = colnames(cnt)
+
+                # Correlation using all non-empty bins
+                tmp = rbindlist(list(PCC=melt.data.table(data.table(corP, keep.rownames = "Row"),
+                                                         id.vars = "Row", variable.name = "Col",
+                                                         value.name = "Value"),
+                                     SCC=melt.data.table(data.table(corS, keep.rownames = "Row"),
+                                                         id.vars = "Row", variable.name = "Col",
+                                                         value.name = "Value")), idcol="Method")
+                return(tmp)
+              })
+
+  names(pl) = paste0(as.integer(c(1e6, 1e5, 2.5e4, 2e4, 1e4)/1e3), "kb")
+  saveRDS(pl, file = file.path(bliss.folder, "BLISS_resolutions_correlations.rds"))
+}else{
+  pl = readRDS(file.path(bliss.folder, "BLISS_resolutions_correlations.rds"))
+}
+
+tmp = rbindlist(pl, idcol="Resolution")
+tmp[, `:=`(Col = factor(Col, levels=names(BLISS_data)),
+           Row = factor(Row, levels=names(BLISS_data)))]
+tmp[, RowNum := .GRP, by="Row"][, ColNum := .GRP, by="Col"]
+tmp[, Resolution := factor(Resolution, levels=names(pl))]
+
+tab = unique(tmp[order(Row, Col), .(Row)])
+tab[, Group := tstrsplit(Row, "_")[[1]]]
+tab = tab[, .N, by="Group"]
+tab[, `:=`(Min = cumsum(N)-N+0.5, Max = cumsum(N)+0.5)]
+
+gg = ggplot(tmp, aes(x = ColNum, y =  RowNum)) +
+  geom_tile(data = tmp, aes(fill = Value), col="white", lwd=1, na.rm = TRUE) +
+  geom_rect(data=tab, aes(xmin=Min, ymin=Min, xmax=Max, ymax=Max), inherit.aes = FALSE, fill=NA, col="grey25") +
+  # geom_tile(data = subset(tmp, !is.na(Value)), aes(fill = Value), col="white", lwd=1) +
+  # geom_tile(data = subset(tmp, is.na(Value)), fill = "white") +
+  scale_x_continuous(breaks=1:length(BLISS_data), labels=names(BLISS_data)) + scale_y_continuous(breaks=1:length(BLISS_data), labels=names(BLISS_data), position = "right") +
+  scale_fill_gsea(name="Pearson\nCorrelation", limits=c(-1,1), na.value = NA) +
+  geom_text(aes(label=round(Value, 2), family="Helvetica", fontface="bold"), size=2) +
+  facet_wrap(Method~Resolution, nrow = 2, scales="free") +
+  theme_pubr() +
+  theme(plot.title=element_text(hjust=0.5), axis.title=element_blank(), axis.text.x=element_text(angle=45, hjust=1), strip.background = element_blank())
+save_and_plot(gg, bname="BLISS_correlations_resolutions", dpi=300, use.cowplot=TRUE,
+              ncol=5, nrow=2, base_height=4, base_aspect_ratio = 0.85, formats = c("png", "pdf"))
+```
