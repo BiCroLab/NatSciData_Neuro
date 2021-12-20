@@ -57,7 +57,7 @@ tar -zxvf insulation_data.tar.gz
 tar -zxvf loop_data.tar.gz
 ```
 
-Finally, main script assumes that the solution BLISS (sBLISS) BED files required are located in the `data/BLISS` folder. The data can be downloaded from [here](). Moreover, you should either rename the BED files as shown below or change the corresponding names in the main script. 
+Finally, main script assumes that the suspension BLISS (sBLISS) BED files required are located in the `data/BLISS` folder. Moreover, you should either rename the BED files as shown below or change the corresponding names in the main script. The raw data can be downloaded from the European Nucleotide Archive (ENA) under the accession [PRJEB49370](https://www.ebi.ac.uk/ena/browser/view/PRJEB49370). For information on how pre-processing, alignment and deduplication, please refer to the [blissNP processing pipeline](https://github.com/BiCroLab/blissNP).  
 
 ```
 NES (replicate 1) --> NES_sBLISS_rep1.bed
@@ -68,4 +68,4 @@ NEU (replicate 1) --> NEU_sBLISS_rep1.bed
 NEU (replicate 2) --> NEU_sBLISS_rep2.bed
 ```
 
-Once the data has been downloaded, moved to the data folder and correctly renamed, you can open R and proceed with the analysis.
+Once the data has been downloaded, processed and placed in the correct folder, you can open R and proceed with the analysis.
