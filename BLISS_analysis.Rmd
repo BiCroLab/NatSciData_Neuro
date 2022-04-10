@@ -3,8 +3,6 @@ title: "BLISS Neurons Analysis"
 author: "Federico Agostini"
 date: "20/08/2019"
 output: html_notebook
-editor_options: 
-  chunk_output_type: console
 ---
 
 ```{r setup, include=FALSE}
@@ -74,6 +72,8 @@ require("viridis")
 require("RColorBrewer")
 
 require("tximport")
+require("DESeq2")
+require("IHW")
 
 require("ChIPpeakAnno")
 require("ChIPseeker")
@@ -81,12 +81,14 @@ require("org.Hs.eg.db")
 require("EnsDb.Hsapiens.v75")
 require("BSgenome.Hsapiens.UCSC.hg19")
 require("TxDb.Hsapiens.UCSC.hg19.knownGene")
+
+require("multiHiCcompare")
 ```
 
 ### Functions
 
 ```{r saveAndPlotFunction}
-save_and_plot <- function(x, bname, width, height, dpi=300, use.cowplot=FALSE, ncol=1, nrow=1, base_height=4, base_width=NULL, base_aspect_ratio=1, plot=FALSE, formats = c("png", "pdf", "eps")){
+save_and_plot <- function(x, bname, width, height, dpi=300, use.cowplot=FALSE, ncol=1, nrow=1, base_height=4, base_width=NULL, base_aspect_ratio=1, plot=TRUE, formats = c("png", "pdf", "eps")){
   # Function to save the plot (and separately its data) to file and show the plot in the notebook
   if( !use.cowplot ){
     if ( "png" %in% formats) {
@@ -340,6 +342,121 @@ rosettaTable = lapply(setNames(c("NES", "NPC", "NEU"), c("NES", "NPC", "NEU")),
             })
 ```
 
+#### Differential Gene Expression (DGE)
+
+```{r DESeq2}
+dds.samples = as.data.table(colnames(salmon_dds$counts))
+setnames(dds.samples, "Label")
+dds.samples[, c("Cell", "Replicate") := tstrsplit(Label, "_")]
+dds.samples[, Cell := factor(Cell, levels=unique(Cell))]
+
+dds = DESeqDataSetFromTximport(salmon_dds, colData = dds.samples, design = ~ Cell)
+
+keep = rowSums(counts(dds)) >= 10
+dds = dds[keep,]
+```
+
+```{r DESeq2_FDR}
+DESeq2_FDR  = 0.001
+```
+
+```{r DESeq2_LTR}
+# # The LRT examines two models for the counts, a full model with a certain number of terms and a reduced model, in which some of the terms of the full model are removed. The test determines if the increased likelihood of the data using the extra terms in the full model is more than expected if those extra terms are truly zero. The LRT is therefore useful for testing multiple terms at once, for example testing 3 or more levels of a factor at once, or all interactions between two variables. The LRT for count data is conceptually similar to an analysis of variance (ANOVA) calculation in linear regression, except that in the case of the Negative Binomial GLM, we use an analysis of deviance (ANODEV), where the deviance captures the difference in likelihood between a full and a reduced model.
+ddsLrt = DESeq(dds, test="LRT", reduced=~1)
+
+# rldLrt = rlog(ddsLrt, blind=FALSE)
+vstLrt = vst(ddsLrt, blind=FALSE)
+
+# Log fold change shrinkage for visualization and ranking
+# Shrinkage of effect size (LFC estimates) is useful for visualization and ranking of genes. To shrink the LFC, we pass the dds object to the function lfcShrink. Below we specify to use the apeglm method for effect size shrinkage (Zhu, Ibrahim, and Love 2018), which improves on the previous estimator.
+contrastList = list(NPC_vs_NES=c("NPC", "NES"), NEU_vs_NPC=c("NEU", "NPC"), NEU_vs_NES=c("NEU", "NES"))
+
+resLrt = lapply(seq_along(contrastList),
+                function(i){
+                  
+                  # To perform all the comparisons using 'apeglm', which accepts only coef, the 'Cell' factor needs to be re-levelled and the DESeq procedure re-run
+                  tmp = dds
+                  tmp$Cell = relevel(tmp$Cell , contrastList[[i]][2])
+                  tmp = DESeq(tmp, test="LRT", reduced=~1)
+            
+                  res = DESeq2::results(tmp, name = paste("Cell", contrastList[[i]][1], "vs", contrastList[[i]][2], sep="_"),
+                                        filterFun = ihw)
+                  
+                  res = lfcShrink(tmp, coef = paste("Cell", contrastList[[i]][1], "vs", contrastList[[i]][2], sep="_"),
+                                  svalue = FALSE, type="apeglm", res = res)
+                  
+                  res = cbind(res, gene.metadata[match(rownames(res), gene_id), .(bioGroup, gene_type, gene_name)])
+                  
+                  # resOrd = res[order(res$svalue),]
+                  resOrd = res[order(res$padj),]
+                  
+                  # Add Entrez ID
+                  resOrd$entrezID = mapIds(org.Hs.eg.db, keys = substr(rownames(resOrd), 1, 15),
+                                           column = "ENTREZID", keytype = "ENSEMBL", multiVals = "first")
+                  resOrd$geneName = mapIds(org.Hs.eg.db, keys = substr(rownames(resOrd), 1, 15),
+                                           column = "SYMBOL", keytype = "ENSEMBL", multiVals = "first")
+                  
+                  fwrite(as.data.frame(resOrd),
+                         file=file.path(working.folder, "tables", paste("DESeq2_LTR", paste(contrastList[[i]], collapse = "_vs_"), "results_complete.csv", sep="_")),
+                         quote = FALSE, sep="\t")
+                  
+                  return(resOrd)
+                })
+names(resLrt) = names(contrastList)
+
+resLrtSig = lapply(seq_along(resLrt),
+                   function(i){
+                     
+                     # res = data.table(as.data.table(as.data.frame(resLrt[[i]]), keep.rownames = "gene_id"))[svalue<0.01,]
+                     res = data.table(as.data.table(as.data.frame(resLrt[[i]]), keep.rownames = "gene_id"))[padj<DESeq2_FDR,]
+                     
+                     fwrite(as.data.frame(res),
+                            file=file.path(working.folder, "tables", paste("DESeq2_LTR", paste(names(resLrt[i]), collapse = "_vs_"), paste0("results_padj", DESeq2_FDR, ".csv"), sep="_")),
+                            quote = FALSE, sep="\t")
+                     
+                     return(res)
+                   })
+names(resLrtSig) = names(resLrt)
+```
+
+```{r}
+require("ComplexHeatmap")
+require("circlize")
+require("pals")
+
+# get the top genes
+plotDat = as.data.frame(assays(vstLrt))
+plotDat = plotDat[, 3:ncol(plotDat)][resLrtSig[[1]][order(padj), gene_id],]
+
+z.mat <- t(scale(t(plotDat), center=TRUE, scale=TRUE)) # same as: t(apply(head(plotDat), 1, function(x) (x-mean(x))/sd(x)))
+# z.mat = head(z.mat, 100)
+rownames(z.mat) = resLrtSig[[1]][match(rownames(z.mat), gene_id), entrezID]
+
+# colour palette
+maxValue = ceiling(max(abs(range(z.mat)))*10)/10
+myRamp = colorRamp2(colors = coolwarm(100), breaks = seq(-maxValue, maxValue, length.out = 100))
+
+ha1 = HeatmapAnnotation(Cell = colData(ddsLrt)[, "Cell"],
+                        col = list(Cell = setNames(pal_npg()(3), c("NES", "NPC", "NEU"))))
+
+hcDat <- hclust(dist(z.mat))
+cutGroups <- cutree(hcDat, h=5)
+
+hm = Heatmap(z.mat, name = "z-score",
+             col = myRamp,            
+             show_row_dend = FALSE,
+             show_row_names = FALSE,
+             cluster_columns = FALSE,
+             split = cutGroups,
+             # rect_gp = gpar(col = "darkgrey", lwd=0.25),
+             top_annotation = ha1,
+             heatmap_legend_param = list(at=-maxValue:maxValue))
+hm = grid::grid.grabExpr(print(hm))
+
+heatmap_clusters = lapply(with(as.data.table(cutGroups, keep.rownames = TRUE),
+                               split(rn, paste0("Cluster", cutGroups))), unique)
+```
+
 ### BLISS
 
 ```{r metrics_NP_pipeline}
@@ -410,7 +527,7 @@ setnames(librarySize, c("Sample", "Size"))
 setkey(librarySize, Sample)
 ```
 
-```{r BLISS_ChIPSeeker_annotation}
+```{r BLISS_ChIPSeeker_annotation, eval=FALSE}
 TxDb = TxDb.Hsapiens.UCSC.hg19.knownGene
 peakAnno <- lapply(BLISS_pooled,
          function(x)
@@ -552,7 +669,9 @@ setnames(tab, "V1", "CpGisland")
 setkey(tab, CpGisland)
 
 annoSel = split(annoSel, annoSel$CpGisland)
+```
 
+```{r, eval=FALSE}
 pl = rbindlist(lapply(annoSel,
                       function(sel){
                         rbindlist(lapply(BLISS_pooled,
@@ -766,6 +885,92 @@ gg = ggplot(pl, aes(x=Compartment, y=DSBs, fill=Compartment)) +
   stat_compare_means(comparisons = combn(c("A", "B"), 2, simplify = FALSE), label="p.signif")
 save_and_plot(gg, bname="HiC_compartements_BLISS", formats = c("png", "pdf"),
               dpi=300, use.cowplot = TRUE, ncol = 3, nrow = 1, base_height = 5, base_aspect_ratio = 0.75)
+```
+
+```{r AB_ratio_and_switch}
+pl = dcast(pl, seqnames+start+end~Cell, value.var = c("Compartment", "DSBs"))
+
+pl[, `:=`(NES_to_NPC = paste(Compartment_NES, Compartment_NPC, sep="_to_"),
+          NPC_to_NEU = paste(Compartment_NPC, Compartment_NEU, sep="_to_"),
+          NES_to_NEU = paste(Compartment_NES, Compartment_NEU, sep="_to_"))]
+
+pl = melt.data.table(pl, id.vars = c("seqnames", "start", "end", "DSBs_NES", "DSBs_NPC", "DSBs_NEU"), measure.vars = c("NES_to_NPC", "NPC_to_NEU", "NES_to_NEU"))
+
+pl = melt.data.table(pl, id.vars = c("seqnames", "start", "end", "variable", "value"), measure.vars = c("DSBs_NES", "DSBs_NPC", "DSBs_NEU"), variable.name = "BLISS", value.name = "value2")
+
+gg1 = ggplot(pl, aes(x=value, y=value2)) +
+  geom_violin(aes(fill=BLISS), trim=TRUE) + geom_boxplot(aes(fill=BLISS), outlier.colour = NA, fill="white", width=0.2) +
+  scale_x_discrete("Compartment transition") +
+  scale_y_continuous("DSBs per 1Mb genomic bins (CPM)") +
+  scale_fill_nejm(name="Compartment", guide="none") +
+  facet_grid(variable~BLISS)  +
+  theme_few() +
+  stat_compare_means(comparisons = combn(pl[, unique(value)], 2, simplify = FALSE), hide.ns = TRUE, label = "p.format")
+
+pl[, group := factor(ifelse(value%in%c("A_to_A", "B_to_B"), "Stable", "Changing"), levels = c("Stable", "Changing"))]
+
+gg2 = ggplot(pl, aes(x=group, y=value2)) +
+  geom_violin(aes(fill=BLISS), trim=TRUE) + geom_boxplot(aes(fill=BLISS), outlier.colour = NA, fill="white", width=0.2) +
+  scale_x_discrete("Compartment transition") +
+  scale_y_continuous("DSBs per 1Mb genomic bins (CPM)") +
+  scale_fill_nejm(name="Compartment", guide="none") +
+  facet_grid(variable~BLISS)  +
+  theme_few() +
+  stat_compare_means(comparisons = combn(1:2, 2, simplify = FALSE), hide.ns = TRUE, label = "p.format")
+
+gg = ggarrange(gg1, gg2, ncol=2)
+save_and_plot(gg, bname="New_HiC_compartements_changing_BLISS", formats = c("png", "pdf"),
+              dpi=300, use.cowplot = TRUE, ncol = 6, nrow = 3, base_height = 4, base_aspect_ratio = 0.75)
+```
+
+```{r}
+ClusterList = heatmap_clusters
+
+Background = as.data.table(select(org.Hs.eg.db, keys=substr(rownames(resLrt[[1]]), 1, 15), keytype = "ENSEMBL",
+                                  columns = c("ENTREZID", "GENETYPE"), multiVals = "first"))
+Background = Background[, .(ENTREZID=unique(ENTREZID))]
+
+CompList = with(pl, split(GRanges(seqnames, IRanges(start, end)), paste(variable, group, sep="_")))
+CompList = lapply(CompList, function(x) unique(subsetByOverlaps(promoters(GRanges(gene.metadata[entrez_id%in%Background[, ENTREZID],]), 0, 1), x)$entrez_id))
+
+pl = rbindlist(lapply(c(list(Background = setdiff(Background[!is.na(ENTREZID), as.character(ENTREZID)], unlist(ClusterList))), ClusterList),
+                      function(x)
+                        rbindlist(lapply(CompList,
+                                         function(y){
+                                           data.table(In = length(intersect(x, y)),
+                                                      Out = length(y)-length(intersect(x, y)),
+                                                      N = length(x))
+                                         }), idcol="CompList")), idcol="Dataset")
+
+tab = rbindlist(lapply(setNames(seq_along(ClusterList), names(ClusterList)),
+                       function(i){
+                         tmp = ClusterList[[i]]
+                         ref = c(Background[, as.character(ENTREZID)], unlist(ClusterList[-i]))
+                         
+                         rbindlist(lapply(CompList,
+                                          function(x){
+                                            grp = x
+                                            df = data.frame(In = c(length(intersect(tmp, grp)), length(intersect(ref, grp))),
+                                                            Out = c(length(setdiff(tmp, grp)), length(setdiff(ref, grp))))
+                                            row.names(df) <- c("Cluster", "Background")
+                                            ft = fisher.test(df, alternative = "greater")
+                                            
+                                            return(data.table(found = df[1,1], not_found = df[1,2], pval = ft$p.value,
+                                                              symbol = as.character(symnum(ft$p.value,
+                                                                                           cutpoints = c(0, 0.0001, 0.001, 0.01, 0.05, 1),
+                                                                                           symbols = c("****", "***", "**", "*", "ns")))))
+                                          }), idcol="CompList")
+                       }), idcol="Dataset")
+
+gg = ggplot(pl[Dataset!="Background"], aes(x=Dataset, y=CompList)) +
+  geom_tile(aes(fill=(In/(In+Out))), colour="white", lwd=1) +
+  scale_y_discrete("Compartment Group") +
+  scale_fill_gradient_tableau(palette = "Blue", name="Fraction of genes in compartment") +
+  geom_text(aes(label=round(In/N, 3))) +
+  geom_text(data=tab[symbol!="ns",], aes(label=symbol), hjust=0.5, vjust=-0.5) +
+  theme_few() + theme(legend.position = "top", legend.key.width = unit(0.05, "npc")) 
+save_and_plot(gg, bname="New_RNAseq_5clusters_CompartmentGroups_table", formats = c("png", "pdf"),
+              width = 8, height = 8, dpi=300, use.cowplot=FALSE)
 ```
 
 ```{r TADs_FANC_BLISS}
@@ -1105,6 +1310,46 @@ save_and_plot(gg, bname="MultiDataset_Categories_NicolaLiterature_Expression", f
               width = 16, height = 10, dpi=300, use.cowplot=FALSE)
 ```
 
+```{r, eval=FALSE}
+genes_metaprofile = c(list(AllGenes = gene_set), lapply(geneLists, function(x) GRanges(gene.metadata[entrez_id%in%x,])))
+
+pl = rbindlist(lapply(genes_metaprofile,
+                      function(sel){
+                        rbindlist(lapply(BLISS_pooled,
+                                         function(x){
+                                           set.seed(42)
+                                           tmp = sample(x, 1.5e7)
+                                           tmp$score = 1/15
+                                           tmp = subsetByOverlaps(tmp, promoters(sel, upstream = 2500, downstream = 2500))
+                                           data.table(binOverFeature(tmp, annotationData=sel,
+                                                                     radius=2500, nbins=25, FUN=sum, errFun=0, minGeneLen=1e3), keep.rownames = "pos")
+                                         }), idcol="Sample")
+                      }), idcol="NDD")
+
+pl[, `:=`(NDD = factor(NDD, levels=names(genes_metaprofile)),
+          Sample = factor(Sample, levels=names(BLISS_pooled)))]
+
+tab = as.data.table(sapply(genes_metaprofile, length), keep.rownames = TRUE)
+setnames(tab, c("NDD", "N"))
+setkey(tab, NDD)
+
+setkey(pl, NDD)
+pl[tab, N := N]
+
+gg = ggplot(pl, aes(x=as.numeric(pos), y=tmp/N, col=Sample)) +
+  ggtitle("DSBs around TSS of GeneSet-specific genes") + 
+  geom_line() + scale_colour_lancet(name="BLISS", alpha=0.75) +
+  scale_x_continuous("Distance from TSS") +
+  scale_y_continuous("BLISS Peaks Density") +
+  geom_text(data=tab, aes(label=paste("N =", N)), x=Inf, y=Inf, hjust=1.2, vjust=1.5, inherit.aes = FALSE, size=4) +
+  facet_wrap(~NDD, scales="free_y") +
+  theme_few() + theme(legend.position="bottom")
+ggsave(gg, filename = file.path(png.folder, "BLISS_peaks_distanceToTSS_protein-coding_CpGisland_expressed.png"),
+       units = "in", width = 12, height = 10, dpi = 300)
+ggsave(gg, filename = file.path(pdf.folder,"BLISS_peaks_distanceToTSS_protein-coding_CpGisland_expressed.pdf"),
+       width = 12, height = 10, device=cairo_pdf)
+```
+
 ### Reproducibility
 
 ```{r BLISS_binning}
@@ -1239,4 +1484,525 @@ gg = ggplot(tmp, aes(x = ColNum, y =  RowNum)) +
   theme(plot.title=element_text(hjust=0.5), axis.title=element_blank(), axis.text.x=element_text(angle=45, hjust=1), strip.background = element_blank())
 save_and_plot(gg, bname="BLISS_correlations_resolutions", dpi=300, use.cowplot=TRUE,
               ncol=5, nrow=2, base_height=4, base_aspect_ratio = 0.85, formats = c("png", "pdf"))
+```
+
+### DIRs
+
+```{r multiHiCcompare}
+sample_rep = c("NES_1", "NES_2", "NPC_1", "NPC_2", "NEU_1", "NEU_2")
+
+if( !file.exists(file.path(working.folder, "RData", "HiCcompare_data.rds")) ){
+  hic.files = list.files(file.path(hic.folder, "HiCcompare"), full.names = TRUE)
+  hic.files = grep("[1|2]_100kb", hic.files, value = TRUE)
+  
+  hic.names = setNames(sample_rep, sample_rep)
+  
+  interactions = lapply(hic.names,
+                        function(x){
+                          hic.subset = grep(x, hic.files, value = TRUE)
+                          # If you are planning to analyse data for more than a single chromosome, you will need to concatenate these matrices together.
+                          rbindlist(lapply(setNames(chromosomes, chromosomes),
+                                           function(y){
+                                             tmp = fread(file.path(hic.folder, "HiCcompare", paste0(x, "_100kb_", y, ".txt")), header=FALSE)
+                                             # The chromosome number should be entered as just the number. Chromosomes such as X, Y, etc. should be entered as 23, 24, etc.
+                                             tmp = tmp[, .(chr=as.numeric(gsub("X", "23", gsub("chr", "", y))), region1=V1, region2=V2, IF=V3)]
+                                             return(tmp)
+                                           }))
+                        })
+  saveRDS(interactions, file = file.path(working.folder, "RData", "HiCcompare_data.rds"))
+}else{
+  interactions = readRDS(file.path(working.folder, "RData", "HiCcompare_data.rds"))
+} 
+
+data("hg19_cyto")
+
+if( !file.exists(file.path(working.folder, "RData", "HiCcompare_HiC_hicexp.rds")) ){
+  tmp1 = interactions[grepl("NES", names(interactions))]
+  tmp2 = interactions[grepl("NPC", names(interactions))]
+  tmp3 = interactions[grepl("NEU", names(interactions))]
+  hicexp = make_hicexp(data_list = c(tmp1, tmp2, tmp3), groups = c(rep(1, length(tmp1)), rep(2, length(tmp2)), rep(3, length(tmp3))),
+                       zero.p = 0.8, A.min = 5, filter = TRUE, remove.regions = hg19_cyto)
+  saveRDS(hicexp, file = file.path(working.folder, "RData", "HiCcompare_HiC_hicexp.rds"))
+}else{
+  hicexp = readRDS(file.path(working.folder, "RData", "HiCcompare_HiC_hicexp.rds"))
+}  
+
+# jointly normalize data
+if( !file.exists(file.path(working.folder, "RData", "HiCcompare_HiC_cyclic.rds")) ){
+  require("BiocParallel")
+  numCores = 2
+  register(MulticoreParam(workers = numCores), default = TRUE)
+  hic_cyclic <- cyclic_loess(hicexp, verbose = FALSE, parallel = TRUE)
+  saveRDS(hic_cyclic, file = file.path(working.folder, "RData", "HiCcompare_HiC_cyclic.rds"))
+}else{
+  hic_cyclic = readRDS(file.path(working.folder, "RData", "HiCcompare_HiC_cyclic.rds"))
+}
+```
+
+```{r multiHiCcompare_results}
+if( !file.exists(file.path(working.folder, "RData", "HiCcompare_HiC_cyclic_results.rds")) ){
+  require("BiocParallel")
+  numCores = 2
+  register(MulticoreParam(workers = numCores), default = TRUE)
+  # compare groups
+  design <- model.matrix(~0+factor(meta(hic_cyclic)$group))
+  colnames(design) <- c("NES", "NPC", "NEU")
+  rownames(design) <- rownames(meta(hic_cyclic))
+  contrasts = limma::makeContrasts(NPCvsNES=NPC-NES, NEUvsNES=NEU-NES, NEUvsNPC=NEU-NPC, levels=design)
+  
+  hic_cyclic_res <- lapply(setNames(colnames(contrasts), colnames(contrasts)),
+                           function(x)
+                             hic_glm(hic_cyclic, design = design, contrast = contrasts[,x], method = "QLFTest", p.method = "fdr", parallel = TRUE))
+  saveRDS(hic_cyclic_res, file = file.path(working.folder, "RData", "HiCcompare_HiC_cyclic_results.rds"))
+}else{
+  hic_cyclic_res = readRDS(file.path(working.folder, "RData", "HiCcompare_HiC_cyclic_results.rds"))
+}  
+```
+
+```{r DIRs_Venn}
+require("ggvenn")
+require("ggthemes")
+
+pl = lapply(hic_cyclic_res, function(x) data.table(topDirs(x, return_df = "bed")))
+
+gg = ggvenn(lapply(pl, function(x) x[, paste(chr, start, end)]), names(pl)[c(1, 3, 2)], stroke_size=0.5) + theme_void() + scale_fill_tableau(palette="Tableau 10")
+
+save_and_plot(gg, bname="HiC_DIRs_cyclic_venn", dpi=300, height=8, width=8, formats = c("png", "pdf"))
+
+gg = ggvenn(lapply(pl, function(x) x[, paste(chr, start, end)]), names(pl)[c(1, 3)], stroke_size=0.5) + theme_void() + scale_fill_tableau(palette="Tableau 10")
+
+save_and_plot(gg, bname="HiC_DIRs_cyclic_venn_2", dpi=300, height=6, width=8, formats = c("png", "pdf"))
+
+pl = lapply(pl, function(x){ tmp = split(x, x[, avgLogFC]>0); names(tmp) = c("Decreased", "Increased"); return(tmp)})
+
+gg1 = ggvenn(lapply(list(NPCvsNES = pl[[1]][["Decreased"]], NEUvsNPC = pl[[3]][["Decreased"]]), function(x) x[, paste(chr, start, end)]), names(pl)[c(1,3)], stroke_size=0.5) + ggtitle("Decreased") + theme_void() + scale_fill_tableau(palette="Tableau 10")
+
+gg2 = ggvenn(lapply(list(NPCvsNES = pl[[1]][["Increased"]], NEUvsNPC = pl[[3]][["Increased"]]), function(x) x[, paste(chr, start, end)]), names(pl)[c(1,3)], stroke_size=0.5) + ggtitle("Increased") + theme_void() + scale_fill_tableau(palette="Tableau 10")
+
+gg = ggarrange(gg1, gg2, ncol = 2)
+save_and_plot(gg, bname="HiC_DIRs_cyclic_venn_3", dpi=300, height=6, width=8, formats = c("png", "pdf"))
+```
+
+```{r DIRs_and_BLISS}
+DIRs_gr = lapply(hic_cyclic_res,
+                 function(x){
+                   tmp = data.table(topDirs(x, logfc_cutoff = 1, logcpm_cutoff = 1, D_cutoff = 2,
+                                            p.adj_cutoff=1e-5,
+                                            return_df = "bed"))
+                   tmp = tmp[, GRanges(gsub("chr23", "chrX", chr), IRanges(start+1, end+1), strand="*",
+                                       count, avgD, avgLogFC, avgLogCPM, avgP.adj)]
+                   return(tmp)
+                 })
+
+overlaps = lapply(DIRs_gr, function(x) findOverlaps(x, gene_set))
+
+gene_counts = lapply(setNames(seq_along(DIRs_gr), names(DIRs_gr)),
+                     function(i){
+                       tmp = with(overlaps[[i]], data.table(as.data.frame(DIRs_gr[[i]][queryHits,]), as.data.frame(gene_set[subjectHits,])))
+                       tmp = tmp[!is.na(entrez_id), .(queryHits = queryHits(overlaps[[i]]), genes = gene_name, gene_id, count, avgLogFC, avgP.adj, entrez_id)]
+                       tmp = tmp[order(avgP.adj, -count),][!duplicated(gene_id),]
+                       return(tmp)
+                     })
+
+DIRs_gr = lapply(hic_cyclic_res,
+                 function(x){
+                   tmp = data.table(topDirs(x, logfc_cutoff = 1, logcpm_cutoff = 1, D_cutoff = 2,
+                                            p.adj_cutoff=1e-5,
+                                            return_df = "bed"))
+                   tmp = tmp[, GRanges(gsub("chr23", "chrX", chr), IRanges(start+1, end+1), strand="*",
+                                       count, avgD, avgLogFC, avgLogCPM, avgP.adj)]
+                   seqlevels(tmp) = paste0("chr", c(1:22, "X"))
+                   return(tmp)
+                 })
+
+pl = rbindlist(lapply(DIRs_gr,
+                      function(x)
+                        rbindlist(lapply(BLISS_pooled,
+                                         function(y)
+                                           data.table(as.data.frame(x),
+                                                      DSB = countOverlaps(x, y)/length(y)*1e6/width(x)*1e3)),
+                                  idcol="BLISS")),
+               idcol="Contrast")
+
+pl[, Interactions := ifelse(avgLogFC>0, "Increased", "Decreased")]
+pl[, BLISS := tstrsplit(BLISS, "_")[[1]]]
+pl = pl[, .(DSB = mean(DSB)), by=c("Contrast", "BLISS", "Interactions", "seqnames", "start", "end")]
+pl[, `:=`(BLISS = factor(BLISS, levels=c("NES", "NPC", "NEU")),
+          Interactions = factor(Interactions, levels=c("Decreased", "Increased")),
+          Contrast = factor(Contrast, levels=c("NPCvsNES", "NEUvsNPC", "NEUvsNES")))]
+gg1 = ggplot(pl, aes(x = Interactions, y = DSB, fill = BLISS)) +
+  ggtitle("DIRs") + 
+  geom_boxplot() +
+  facet_grid(~Contrast) +
+  scale_x_discrete("DIR interactions") +
+  scale_y_continuous("DSB (CPKM)") +
+  theme_few() + coord_cartesian(ylim=c(0, 1))
+gg1.1 = ggplot(pl, aes(x = BLISS, y = DSB, fill = Interactions)) +
+  ggtitle("DIRs") + 
+  geom_boxplot() +
+  facet_grid(~Contrast) +
+  scale_x_discrete("BLISS dataset") +
+  scale_y_continuous("DSB (CPKM)") +
+  theme_few() + guides(fill=guide_legend(title="DIR interactions")) + coord_cartesian(ylim=c(0, 1))
+
+pl = rbindlist(lapply(gene_counts,
+                      function(x)
+                        rbindlist(lapply(BLISS_pooled,
+                                         function(y){
+                                           tmp0 = x[genes%in%gene_set$gene_name & !duplicated(genes),]
+                                           tmp = gene_set[match(tmp0[, genes], gene_set$gene_name),]
+                                           tmp = tmp[!duplicated(tmp$gene_name),]
+                                           data.table(as.data.frame(tmp0),
+                                                      DSB = countOverlaps(promoters(tmp), y)/length(y)*1e6)
+                                         }),
+                                  idcol="BLISS")),
+               idcol="Contrast")
+
+pl[, Interactions := ifelse(avgLogFC>0, "Increased", "Decreased")]
+pl[, BLISS := tstrsplit(BLISS, "_")[[1]]]
+pl = pl[, .(DSB = mean(DSB)), by=c("Contrast", "BLISS", "Interactions", "genes")]
+pl[, `:=`(BLISS = factor(BLISS, levels=c("NES", "NPC", "NEU")),
+          Interactions = factor(Interactions, levels=c("Decreased", "Increased")),
+          Contrast = factor(Contrast, levels=c("NPCvsNES", "NEUvsNPC", "NEUvsNES")))]
+gg2 = ggplot(pl, aes(x = Interactions, y = DSB, fill = BLISS)) +
+  ggtitle("Gene promoters within DIRs") + 
+  geom_boxplot() +
+  facet_grid(~Contrast) +
+  scale_x_discrete("DIR interactions") +
+  scale_y_continuous("DSB at gene promoter (CPM)") +
+  theme_few()
+gg2.1 = ggplot(pl, aes(x = BLISS, y = DSB, fill = Interactions)) +
+  ggtitle("Gene promoters within DIRs") + 
+  geom_boxplot() +
+  facet_grid(~Contrast) +
+  scale_x_discrete("BLISS dataset") +
+  scale_y_continuous("DSB at gene promoter (CPM)") +
+  theme_few() + guides(fill=guide_legend(title="DIR interactions"))
+
+gg = ggarrange(gg1, gg2, nrow=2, ncol = 1, common.legend = TRUE, legend = "right")
+save_and_plot(gg, bname="New_HiC_DIRs_cyclic_BLISS", dpi=300, height=8, width=12, formats = c("png", "pdf"))
+
+gg = ggarrange(gg1.1, gg2.1, nrow=2, ncol = 1, common.legend = TRUE, legend = "right")
+save_and_plot(gg, bname="New_HiC_DIRs_cyclic_BLISS_bis", dpi=300, height=8, width=12, formats = c("png", "pdf"))
+```
+
+```{r load_HiC_data}
+res = as.integer(100000)
+
+hic.names = setNames(c("NES", "NPC", "NEU"), c("NES", "NPC", "NEU"))
+
+if( !file.exists(file.path(working.folder, "RData", paste0("TADcompare_data_", res, ".rds"))) ){
+  interactions = lapply(hic.names,
+                        function(x)
+                          lapply(setNames(chromosomes, chromosomes),
+                                 function(y)
+                                   fread(file.path(hic.folder, "TADcompare", paste0(x, "_", res, "_", y, ".txt")),
+                                         header=FALSE)))
+  saveRDS(interactions, file = file.path(working.folder, "RData", paste0("TADcompare_data_", res, ".rds")))
+}else{
+  interactions = readRDS(file.path(working.folder, "RData", paste0("TADcompare_data_", res, ".rds")))
+} 
+```
+
+```{r TADcompare_TimeCourse}
+require("TADCompare")
+
+# TADs time-course analysis
+tad.time = lapply(setNames(chromosomes, chromosomes),
+                  function(x)
+                    TimeCompare(lapply(interactions,
+                                       function(y)
+                                         y[[x]]), resolution = res))
+
+pl = rbindlist(lapply(setNames(chromosomes, chromosomes),
+                      function(x)
+                        as.data.table(tad.time[[x]]$Count_Plot$data)), idcol = "chrom")
+pl[, `:=`(chrom = factor(chrom, levels = chromosomes),
+          Category = factor(Category, levels = rev(c("Early Appearing TAD", "Early Disappearing TAD",
+                                                     "Late Appearing TAD", "Late Disappearing TAD",
+                                                     "Dynamic TAD", "Highly Common TAD"))))]
+pl[, Percentage := Count/sum(Count), by="chrom"]
+
+gg1 = ggplot(pl, aes(x = chrom, y = Count, fill = Category)) +
+  geom_bar(stat = "identity", position = "stack", colour = "black") +
+  scale_fill_manual(values = rev(pal_d3()(6))) +
+  scale_x_discrete("Chromosome") +
+  theme_pubr() + guides(fill = guide_legend(reverse = TRUE))
+gg2 = ggplot(pl, aes(x = chrom, y = Percentage, fill = Category)) +
+  geom_bar(stat = "identity", position = "stack", colour = "black") +
+  scale_fill_manual(values = rev(pal_d3()(6))) +
+  scale_x_discrete("Chromosome") + scale_y_continuous(labels = percent) +
+  theme_pubr() + guides(fill = guide_legend(reverse = TRUE))
+gg = ggarrange(gg1, gg2, ncol=1, common.legend = TRUE, legend = "bottom")
+
+save_and_plot(gg, bname="HiC_TADs_TADcompare_TimeCourse_chromosomes", formats = c("png", "pdf"),
+              dpi=300, use.cowplot = TRUE, ncol = 1, nrow = 2, base_height = 6, base_aspect_ratio = 2.5)
+
+
+pl = pl[, .(Count = sum(Count)), by="Category"]
+pl[, Percentage := Count/sum(Count)]
+
+gg1 = ggplot(pl, aes(x = Category, y = Count, fill = Category)) +
+  geom_bar(stat = "identity", position = "stack", colour = "black") +
+  scale_fill_d3() + scale_x_discrete("Category") + theme_pubr() + guides(fill = "none") + coord_flip()
+gg2 = ggplot(pl, aes(x = Category, y = Percentage, fill = Category)) +
+  geom_bar(stat = "identity", position = "stack", colour = "black") +
+  scale_fill_d3() + scale_x_discrete("Category") + scale_y_continuous(labels = percent) + theme_pubr() + guides(fill = "none") + coord_flip()
+gg = ggarrange(gg1, gg2, nrow=2)
+
+save_and_plot(gg, bname="HiC_TADs_TADcompare_TimeCourse_genome", formats = c("png", "pdf"),
+              dpi=300, use.cowplot = TRUE, ncol = 1, nrow = 2, base_height = 4, base_aspect_ratio = 2)
+
+# Consensus TADs
+tad.consensus = lapply(setNames(chromosomes, chromosomes),
+                       function(x)
+                         ConsensusTADs(lapply(interactions,
+                                              function(y)
+                                                y[[x]]), resolution = res))
+```
+
+```{r TADcompare_DSB_burden}
+TADs_cat = rbindlist(lapply(setNames(chromosomes, chromosomes),
+                       function(x)
+                         as.data.table(tad.time[[x]]$TAD_Bounds)), idcol = "chrom")
+TADs_cat[, `:=`(chrom = factor(chrom, levels = chromosomes),
+           Category = factor(Category, levels = rev(c("Early Appearing TAD", "Early Disappearing TAD",
+                                                      "Late Appearing TAD", "Late Disappearing TAD",
+                                                      "Dynamic TAD", "Highly Common TAD"))))]
+
+pl = rbindlist(lapply(BLISS_pooled,
+                      function(x){
+                        tmp = TADs_cat[, .(seqnames=chrom, start=Coordinate, end=Coordinate, Category)]
+                        data.table(tmp,
+                                   DSBs = countOverlaps(flank(GRanges(tmp), width=2.5e4, start = TRUE, both = TRUE),
+                                                        x)/length(x)*1e6/50)
+                      }), idcol="Cell")
+
+pl[, `:=`(Cell = factor(Cell, levels=names(BLISS_pooled)),
+          Category = factor(Category, levels = c("Early Appearing TAD", "Early Disappearing TAD",
+                                                 "Late Appearing TAD", "Late Disappearing TAD",
+                                                 "Dynamic TAD", "Highly Common TAD")))]
+
+gg = ggplot(pl, aes(x=Category, y=DSBs)) +
+  geom_boxplot() +
+  scale_y_continuous("DSBs around (+/-25kb) TAD boundaries (per kb)") +
+  facet_grid(~Cell) +
+  theme_few() +
+  stat_compare_means(comparisons = combn(c("Early Appearing TAD", "Early Disappearing TAD",
+                                           "Late Appearing TAD", "Late Disappearing TAD",
+                                           "Dynamic TAD", "Highly Common TAD"), 2, simplify = FALSE),
+                     label="p.signif")
+save_and_plot(gg, bname="HiC_TADs_TADcompare_BLISS_win25kb", formats = c("png", "pdf"),
+              dpi=300, use.cowplot = TRUE, ncol = 3, nrow = 1, base_height = 7, base_aspect_ratio = 1.5)
+```
+
+### Loops
+
+```{r Mustache_Loops}
+mustache_loops = list(NES = fread(file.path(hic.folder, "Mustache", "NPCvsNES.loop1")),
+                      NPC = fread(file.path(hic.folder, "Mustache", "NPCvsNES.loop2")),
+                      NEU = fread(file.path(hic.folder, "Mustache", "NEUvsNPC.loop2")))
+
+pl = rbindlist(mustache_loops, idcol="Cell")[, .(Cell, Chrom=BIN1_CHR, Width=(BIN2_START-BIN1_START))]
+pl[, Cell := factor(Cell, levels=c("NES", "NPC", "NEU"))]
+
+gg = ggplot(pl, aes(x=Cell, y=Width/1e3, fill=Cell)) +
+  geom_violin(trim=TRUE) + geom_boxplot(fill="white", width=0.2, outlier.colour = NA) +
+  scale_y_log10("Loop width (kb)", label=comma, limits=c(25, 2500), breaks=c(10, 25, 50, 100, 250, 500, 1000, 2500)) +
+  scale_fill_lancet(alpha=0.75, guide="none") +
+  geom_text(data=pl[, .N, by="Cell"], aes(x=Cell, label=paste("N =", N)), y=-Inf, vjust=-1, inherit.aes = FALSE) +
+  theme_few()
+save_and_plot(gg, bname="HiC_Loops_Mustache_Count_and_Width", formats = c("png", "pdf"),
+              dpi=300, use.cowplot = FALSE, height = 6, width = 6)
+
+mustache_loops = lapply(mustache_loops, function(x) x[, label := paste(BIN1_CHR, BIN1_START, BIN1_END, BIN2_CHROMOSOME, BIN2_START, BIN2_END)])
+```
+
+```{r Mustache_Loops_categories}
+mustache_loops_cat = unique(rbindlist(mustache_loops)[, .(label)])
+
+mustache_loops_cat[, `:=`(overlapNES = label%in%mustache_loops[[1]][, label],
+                          overlapNPC = label%in%mustache_loops[[2]][, label],
+                          overlapNEU = label%in%mustache_loops[[3]][, label])]
+
+mustache_loops_cat[overlapNES==TRUE & overlapNPC==TRUE & overlapNEU==TRUE, Category := "Conserved Loops"]
+mustache_loops_cat[is.na(Category) & overlapNES==FALSE & overlapNPC==TRUE & overlapNEU==TRUE, Category := "Early Appearing Loops"]
+mustache_loops_cat[is.na(Category) & overlapNES==FALSE & overlapNPC==FALSE & overlapNEU==TRUE, Category := "Late Appearing Loops"]
+mustache_loops_cat[is.na(Category) & overlapNES==TRUE & overlapNPC==FALSE & overlapNEU==FALSE, Category := "Early Disappearing Loops"]
+mustache_loops_cat[is.na(Category) & overlapNES==TRUE & overlapNPC==TRUE & overlapNEU==FALSE, Category := "Late Disappearing Loops"]
+mustache_loops_cat[is.na(Category) & overlapNES==FALSE & overlapNPC==TRUE & overlapNEU==FALSE, Category := "Dynamic Loops"]
+mustache_loops_cat[is.na(Category) & overlapNES==TRUE & overlapNPC==FALSE & overlapNEU==TRUE, Category := "Dynamic Loops"]
+
+mustache_loops_cat[, c("chr1", "start1", "end1", "chr2", "start2", "end2") := tstrsplit(label, " ")]
+mustache_loops_cat = mustache_loops_cat[, .(chr1, start1 = as.numeric(start1), end1 = as.numeric(end1),
+                                            chr2, start2 = as.numeric(start2), end2 = as.numeric(end2), Category)]
+
+pl = mustache_loops_cat[, .(Count = .N), by="Category"][, .(Category, Count, Percentage = Count/sum(Count))]
+pl[, Category := factor(Category, levels = rev(c("Early Appearing Loops", "Early Disappearing Loops",
+                                                 "Late Appearing Loops", "Late Disappearing Loops",
+                                                 "Dynamic Loops", "Conserved Loops")))]
+
+gg1 = ggplot(pl, aes(x = Category, y = Count, fill = Category)) +
+  geom_bar(stat = "identity", position = "stack", colour = "black") +
+  scale_fill_d3() + scale_x_discrete("Category") + theme_pubr() + guides(fill = "none") + coord_flip()
+gg2 = ggplot(pl, aes(x = Category, y = Percentage, fill = Category)) +
+  geom_bar(stat = "identity", position = "stack", colour = "black") +
+  scale_fill_d3() + scale_x_discrete("Category") + scale_y_continuous(labels = percent) + theme_pubr() + guides(fill = "none") + coord_flip()
+gg = ggarrange(gg1, gg2, nrow=2)
+
+save_and_plot(gg, bname="HiC_Loops_Mustache_Categories_genome", formats = c("png", "pdf"),
+              dpi=300, use.cowplot = TRUE, ncol = 1, nrow = 2, base_height = 4, base_aspect_ratio = 2)
+```
+
+```{r Mustache_Loops_categories_BLISS}
+pl = rbindlist(lapply(BLISS_pooled,
+                      function(x){
+                        tmp = unique(mustache_loops_cat[, .(seqnames=c(chr1, chr2), start=c(start1, start2),
+                                                     end=c(end1, end2), Category=c(Category, Category))])
+                        data.table(tmp,
+                                   DSBs = countOverlaps(resize(GRanges(tmp), width=1e4, fix="center"),
+                                                        x)/length(x)*1e6/50)
+                      }), idcol="Cell")
+
+pl[, `:=`(Cell = factor(Cell, levels=names(BLISS_pooled)),
+          Category = factor(Category, levels = c("Early Appearing Loops", "Early Disappearing Loops",
+                                                 "Late Appearing Loops", "Late Disappearing Loops",
+                                                 "Dynamic Loops", "Conserved Loops")))]
+
+gg = ggplot(pl[DSBs<0.5], aes(x=Category, y=DSBs)) +
+  geom_boxplot() +
+  scale_y_continuous("DSBs around (+/-5kb) Loop anchors (per kb)") +
+  facet_grid(~Cell) +
+  theme_few() +
+  stat_compare_means(comparisons = combn(c("Early Appearing Loops", "Early Disappearing Loops",
+                                           "Late Appearing Loops", "Late Disappearing Loops",
+                                           "Dynamic Loops", "Conserved Loops"), 2, simplify = FALSE),
+                     label="p.signif")
+save_and_plot(gg, bname="HiC_Loops_Mustache_BLISS_win10kb", formats = c("png", "pdf"),
+              dpi=300, use.cowplot = TRUE, ncol = 3, nrow = 1, base_height = 7, base_aspect_ratio = 1.5)
+```
+
+```{r Genes_from_literature_Nicola}
+tmpTAD = rbindlist(lapply(tad.time,
+                          function(x)
+                            as.data.table(x$TAD_Bounds)[, .(start=Coordinate-2.5e4,
+                                                            end=Coordinate+2.5e4,
+                                                            Category)]), idcol="seqnames")
+overlaps = as.data.table(findOverlaps(gene_set, GRanges(tmpTAD)))
+tmpTAD = with(overlaps, data.table(ENTREZ=gene_set[queryHits,]$entrez_id, Category=tmpTAD[subjectHits, Category]))
+tmpTAD = split(tmpTAD[, ENTREZ], tmpTAD[, Category])
+# tmpTAD = tmpTAD[!grepl("Highly Common TAD", names(tmpTAD))]
+
+tmpLoop = rbindlist(list(mustache_loops_cat[, .(seqnames = chr1, start = start1, end = end1, Category)],
+                         mustache_loops_cat[, .(seqnames = chr2, start = start2, end = end2, Category)]))
+overlaps = as.data.table(findOverlaps(gene_set, GRanges(tmpLoop)))
+tmpLoop = with(overlaps, data.table(ENTREZ=gene_set[queryHits,]$entrez_id, Category=tmpLoop[subjectHits, Category]))
+tmpLoop = split(tmpLoop[, ENTREZ], tmpLoop[, Category])
+# tmpLoop = tmpLoop[!grepl("Conserved Loops", names(tmpLoop))]
+
+testGroups = list(TADs = tmpTAD, Loops = tmpLoop)
+
+tab = rbindlist(lapply(testGroups,
+                       function(x){
+                         rbindlist(lapply(x,
+                                          function(y){
+                                            ref = setdiff(gene_set$entrez_id, y)
+                                            rbindlist(lapply(geneLists,
+                                                             function(z){
+                                                               grp = z
+                                                               df = data.frame(In = c(length(intersect(y, grp)),
+                                                                                      length(intersect(ref, grp))),
+                                                                               Out = c(length(setdiff(y, grp)),
+                                                                                       length(setdiff(ref, grp))))
+                                                               row.names(df) <- c("Feature", "Background")
+                                                               ft = fisher.test(df, alternative = "greater")
+                                                               
+                                                               return(data.table(found = df[1,1], not_found = df[1,2], pval = ft$p.value,
+                                                                                 symbol = as.character(symnum(ft$p.value,
+                                                                                                              cutpoints = c(0, 0.0001, 0.001, 0.01, 0.05, 1),
+                                                                                                              symbols = c("****", "***", "**", "*", "ns")))))
+                                                             }), idcol="geneLists")
+                                          }), idcol="Category")
+                       }), idcol="Dataset")
+
+gg = ggplot(tab, aes(x=geneLists, y=Category)) +
+  geom_tile(aes(fill=found/(found+not_found)), colour="white", lwd=1) +
+  # scale_y_discrete("Literature dataset") +
+  scale_fill_gradient_tableau(palette = "Blue", name="Literature dataset fraction") +
+  geom_text(aes(label=round(found/(found+not_found), 3))) +
+  geom_text(aes(label=symbol), hjust=0.5, vjust=-0.5) +
+  facet_wrap(~Dataset, scales="free") +
+  theme_few() + theme(axis.text.x=element_text(angle=30, hjust=1), legend.position="bottom")
+save_and_plot(gg, bname="MultiDataset_Categories_NDD_GeneEnrichments", formats = c("png", "pdf"),
+              width = 24, height = 12, dpi=300, use.cowplot=FALSE)
+
+rosettaTable = lapply(rosettaTable,
+                      function(x)
+                        x[, exprDecile := findInterval(expression,
+                                                       quantile(expression, seq(0, 1, 0.1)), all.inside = TRUE)])
+
+pl = rbindlist(lapply(setNames(seq_along(geneLists), names(geneLists)),
+                      function(i){
+                        ref = setdiff(gene_set$entrez_id, geneLists[[i]])
+                        ref = data.table(Category="Background",
+                                         rbindlist(lapply(rosettaTable,
+                                                          function(y)
+                                                            y[entrez_id%in%unique(ref),]),
+                                                   idcol="Cell"))
+                        grp = data.table(Category=names(geneLists[i]),
+                                         rbindlist(lapply(rosettaTable,
+                                                          function(y)
+                                                            y[entrez_id%in%geneLists[[i]],]),
+                                                   idcol="Cell"))
+                                         tmp = rbindlist(list(ref, grp))
+                                         return(tmp)
+                      }), idcol="Group")
+               
+ggl = lapply(pl[, unique(Group)],
+             function(x){
+               tmp = pl[Group == x,]
+               tmp[,`:=`(Cell = factor(Cell, levels=c("NES", "NPC", "NEU")),
+                                         Category = factor(Category, levels=unique(Category)))]
+               
+               ggplot(tmp, aes(x=Category, y=BLISS_prom+1)) +
+                 geom_boxplot(notch=FALSE) +
+                 scale_x_discrete("") + scale_y_log10("DSB burden at gene promoter (CPM+1)") +
+                 facet_grid(Cell~., scales="free_x") +
+                 theme_few() + theme(axis.text.x=element_text(angle=30, hjust=1)) +
+                 stat_compare_means(ref.group = "Background", label = "p.signif")
+             })
+gg = ggarrange(plotlist=ggl, ncol=length(geneLists))
+save_and_plot(gg, bname="MultiDataset_Categories_NDD_DSBpromoter", formats = c("png", "pdf"),
+              width = 20, height = 10, dpi=300, use.cowplot=FALSE)
+
+ggl = lapply(pl[, unique(Group)],
+             function(x){
+               tmp = pl[Group == x,]
+               tmp[,`:=`(Cell = factor(Cell, levels=c("NES", "NPC", "NEU")),
+                                         Category = factor(Category, levels=unique(Category)))]
+               
+               ggplot(tmp, aes(x=Category, y=BLISS_body+1)) +
+                 geom_boxplot(notch=TRUE) +
+                 scale_x_discrete("") + scale_y_log10("DSBs burden in gene (CPKM+1)") +
+                 facet_grid(Cell~., scales="free") +
+                 theme_few() + theme(axis.text.x=element_text(angle=30, hjust=1)) +
+                 stat_compare_means(ref.group = "Background", label = "p.signif")
+             })
+gg = ggarrange(plotlist=ggl, ncol=length(geneLists))
+save_and_plot(gg, bname="MultiDataset_Categories_NDD_DSBbody", formats = c("png", "pdf"),
+              width = 20, height = 10, dpi=300, use.cowplot=FALSE)
+
+pl = pl[Category!="Background", .N, by=c("Cell", "Group", "exprDecile")]
+pl[,`:=`(Cell = factor(Cell, levels=c("NES", "NPC", "NEU")),
+         Group = factor(Group, levels=unique(Group)),
+         exprDecile = factor(exprDecile, levels=1:10))]
+pl[, P := N/sum(N), by=c("Cell", "Group")]
+
+gg = ggplot(pl, aes(x=exprDecile, y=P)) +
+  geom_bar(stat="identity", position="identity", col="black") +
+  scale_y_continuous("Dataset fraction") + scale_x_discrete("Expression decile", limits=as.factor(1:10)) +
+  facet_grid(Cell~Group) +
+  theme_few()
+save_and_plot(gg, bname="MultiDataset_Categories_NDD_ExpressionDeciles", formats = c("png", "pdf"),
+              width = 24, height = 12, dpi=300, use.cowplot=FALSE)
 ```
